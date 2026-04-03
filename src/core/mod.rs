@@ -195,6 +195,13 @@ pub struct ArtifactRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextBundle {
+    pub summary: String,
+    pub cell_ids: Vec<String>,
+    pub snippets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum BridgeValue {
     Stdout(String),
@@ -234,10 +241,23 @@ pub struct ExecutionRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AiRunRecord {
+    pub prompt_cell_id: String,
+    pub prompt: String,
+    pub context: ContextBundle,
+    pub provider_name: String,
+    pub model_id: String,
+    pub response: String,
+    pub error_output: String,
+    pub status: ExecutionStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionManifest {
     pub session_id: SessionId,
     pub notebook_title: String,
     pub named_values: BTreeMap<String, String>,
+    pub ai_history: Vec<AiRunRecord>,
     pub execution_history: Vec<ExecutionRecord>,
     pub artifacts: Vec<ArtifactRef>,
 }
@@ -248,6 +268,7 @@ impl SessionManifest {
             session_id: SessionId::new(),
             notebook_title: notebook.metadata.title.clone(),
             named_values: BTreeMap::new(),
+            ai_history: Vec::new(),
             execution_history: Vec::new(),
             artifacts: Vec::new(),
         }

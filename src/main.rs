@@ -3,8 +3,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use strata::ai::AiRuntime;
 use strata::core::{Cell, Language, Notebook};
-use strata::runtime::{SessionManager, run_notebook_cells, summarize_records};
+use strata::runtime::{
+    SessionManager, load_session_for_notebook, run_notebook_cells, summarize_records,
+};
 use strata::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
 use strata::tui::{App, should_launch_tui};
 
@@ -32,13 +35,21 @@ fn main() -> Result<()> {
 }
 
 fn open_command(path: Option<PathBuf>) -> Result<()> {
-    let notebook = match path {
-        Some(path) => NotebookStorage::load_markdown(&path)?,
-        None => demo_notebook(),
+    let (notebook, notebook_path, session) = match path {
+        Some(path) => {
+            let notebook = NotebookStorage::load_markdown(&path)?;
+            let session = load_session_for_notebook(&path, &notebook)?;
+            (notebook, Some(path), session)
+        }
+        None => {
+            let notebook = demo_notebook();
+            let session = SessionManager::new(&notebook).with_ai_runtime(AiRuntime::from_env()?);
+            (notebook, None, session)
+        }
     };
 
     if should_launch_tui() {
-        App::new(notebook).run()?;
+        App::new(notebook, notebook_path, session).run()?;
     } else {
         println!("{}", NotebookStorage::render_markdown(&notebook));
     }
@@ -49,15 +60,7 @@ fn open_command(path: Option<PathBuf>) -> Result<()> {
 fn run_command(path: PathBuf) -> Result<()> {
     let notebook = NotebookStorage::load_markdown(&path)?;
     let checkpoint_paths = CheckpointPaths::for_notebook(&path);
-    let manifest = if CheckpointStorage::exists(&checkpoint_paths) {
-        CheckpointStorage::load(&checkpoint_paths)?
-    } else {
-        strata::core::SessionManifest::new(&notebook)
-    };
-
-    let mut session = SessionManager::from_manifest(manifest);
-    session.register_default_kernels()?;
-    session.hydrate()?;
+    let mut session = load_session_for_notebook(&path, &notebook)?;
 
     let records = run_notebook_cells(&mut session, &notebook)
         .with_context(|| format!("failed to execute notebook {}", path.display()))?;

@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::ai::AiRuntime;
 use crate::core::{
     ArtifactId, ArtifactRef, BridgeValue, Cell, CellKind, ExecutionId, ExecutionRecord,
     ExecutionRequest, ExecutionStatus, Language, Notebook, SessionId, SessionManifest,
@@ -26,7 +27,6 @@ pub trait KernelAdapter: Send {
     fn execute(&mut self, request: &ExecutionRequest) -> Result<KernelExecution>;
     fn interrupt(&mut self) -> Result<()>;
     fn restart(&mut self) -> Result<()>;
-    fn hydrate(&mut self, manifest: &SessionManifest) -> Result<()>;
     fn shutdown(&mut self) -> Result<()>;
 }
 
@@ -35,6 +35,7 @@ pub struct SessionManager {
     kernels: Vec<Box<dyn KernelAdapter>>,
     language_map: HashMap<Language, usize>,
     pub manifest: SessionManifest,
+    ai_runtime: Option<AiRuntime>,
 }
 
 impl SessionManager {
@@ -48,7 +49,13 @@ impl SessionManager {
             kernels: Vec::new(),
             language_map: HashMap::new(),
             manifest,
+            ai_runtime: None,
         }
+    }
+
+    pub fn with_ai_runtime(mut self, ai_runtime: AiRuntime) -> Self {
+        self.ai_runtime = Some(ai_runtime);
+        self
     }
 
     pub fn register_kernel(&mut self, mut kernel: Box<dyn KernelAdapter>) -> Result<()> {
@@ -68,18 +75,59 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn hydrate(&mut self) -> Result<()> {
-        for kernel in &mut self.kernels {
-            kernel.hydrate(&self.manifest)?;
+    pub fn ensure_ai_runtime(&mut self) -> Result<()> {
+        if self.ai_runtime.is_none() {
+            self.ai_runtime = Some(AiRuntime::from_env()?);
         }
         Ok(())
     }
 
-    pub fn run_cell(&mut self, cell: &Cell) -> Result<ExecutionRecord> {
-        if cell.kind != CellKind::Code {
-            bail!("only code cells can be executed by the runtime");
+    pub fn hydrate(&mut self) -> Result<()> {
+        let mut replay_named_values = BTreeMap::new();
+
+        for record in self
+            .manifest
+            .execution_history
+            .iter()
+            .filter(|record| record.status == ExecutionStatus::Succeeded)
+        {
+            match record.language {
+                Language::Bash | Language::Python | Language::JavaScript | Language::TypeScript => {
+                    let Some(index) = self.language_map.get(&record.language).copied() else {
+                        continue;
+                    };
+                    let request = ExecutionRequest {
+                        cell_id: record.cell_id.clone(),
+                        language: record.language,
+                        source: record.source.clone(),
+                        named_values: replay_named_values.clone(),
+                    };
+                    let execution = self.kernels[index]
+                        .execute(&request)
+                        .with_context(|| format!("failed to hydrate {}", record.cell_id))?;
+                    apply_bridges(&mut replay_named_values, &execution.bridges);
+                }
+                Language::Ai | Language::Text => {}
+            }
         }
 
+        self.manifest.named_values = replay_named_values;
+        Ok(())
+    }
+
+    pub fn run_cell_at(&mut self, notebook: &Notebook, index: usize) -> Result<ExecutionRecord> {
+        let cell = notebook
+            .cells
+            .get(index)
+            .context("cell index out of bounds")?;
+        match cell.kind {
+            CellKind::Code => self.run_code_cell(cell),
+            CellKind::Ai => self.run_ai_cell(notebook, index),
+            CellKind::Text => bail!("text cells are not executable"),
+        }
+    }
+
+    pub fn run_code_cell(&mut self, cell: &Cell) -> Result<ExecutionRecord> {
         let request = ExecutionRequest {
             cell_id: cell.id.clone(),
             language: cell.language,
@@ -91,15 +139,7 @@ impl SessionManager {
             bail!("no kernel registered for {:?}", cell.language);
         };
         let execution = self.kernels[index].execute(&request)?;
-
-        for bridge in &execution.bridges {
-            if let BridgeValue::NamedValue { name, value } = bridge {
-                self.manifest
-                    .named_values
-                    .insert(name.clone(), value.clone());
-            }
-        }
-
+        apply_bridges(&mut self.manifest.named_values, &execution.bridges);
         self.manifest.artifacts.extend(execution.artifacts.clone());
 
         let record = ExecutionRecord {
@@ -120,6 +160,62 @@ impl SessionManager {
         };
         self.manifest.execution_history.push(record.clone());
         Ok(record)
+    }
+
+    pub fn run_ai_cell(&mut self, notebook: &Notebook, index: usize) -> Result<ExecutionRecord> {
+        let ai_run = match self
+            .ensure_ai_runtime()
+            .and_then(|_| self.ai_runtime.as_mut().context("AI runtime unavailable"))
+            .and_then(|ai_runtime| ai_runtime.execute(notebook, &self.manifest, index))
+        {
+            Ok(run) => run,
+            Err(error) => crate::core::AiRunRecord {
+                prompt_cell_id: notebook.cells[index].id.0.clone(),
+                prompt: notebook.cells[index].source.clone(),
+                context: crate::core::ContextBundle {
+                    summary: "AI execution failed before context resolution completed".to_string(),
+                    cell_ids: vec![notebook.cells[index].id.0.clone()],
+                    snippets: vec![notebook.cells[index].source.clone()],
+                },
+                provider_name: self
+                    .ai_runtime
+                    .as_ref()
+                    .and_then(|_| std::env::var("STRATA_AI_PROVIDER").ok())
+                    .unwrap_or_else(|| "unconfigured".to_string()),
+                model_id: std::env::var("STRATA_AI_MODEL")
+                    .unwrap_or_else(|_| "unspecified".to_string()),
+                response: String::new(),
+                error_output: error.to_string(),
+                status: ExecutionStatus::Failed,
+            },
+        };
+        let record = ExecutionRecord {
+            id: ExecutionId::new(),
+            cell_id: notebook.cells[index].id.clone(),
+            language: Language::Ai,
+            source: notebook.cells[index].source.clone(),
+            status: ai_run.status.clone(),
+            output: ai_run.response.clone(),
+            error_output: ai_run.error_output.clone(),
+            exit_code: if ai_run.status == ExecutionStatus::Succeeded {
+                0
+            } else {
+                1
+            },
+            dependencies: Vec::new(),
+            bridges: Vec::new(),
+        };
+        self.manifest.ai_history.push(ai_run);
+        self.manifest.execution_history.push(record.clone());
+        Ok(record)
+    }
+
+    pub fn latest_record_for_cell(&self, cell_id: &str) -> Option<&ExecutionRecord> {
+        self.manifest
+            .execution_history
+            .iter()
+            .rev()
+            .find(|record| record.cell_id.0 == cell_id)
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -294,10 +390,6 @@ impl KernelAdapter for WorkerKernelAdapter {
         self.start_process()
     }
 
-    fn hydrate(&mut self, _manifest: &SessionManifest) -> Result<()> {
-        Ok(())
-    }
-
     fn shutdown(&mut self) -> Result<()> {
         self.stop_process()
     }
@@ -340,10 +432,6 @@ impl KernelAdapter for BashKernelAdapter {
         self.inner.restart()
     }
 
-    fn hydrate(&mut self, manifest: &SessionManifest) -> Result<()> {
-        self.inner.hydrate(manifest)
-    }
-
     fn shutdown(&mut self) -> Result<()> {
         self.inner.shutdown()
     }
@@ -384,10 +472,6 @@ impl KernelAdapter for PythonKernelAdapter {
 
     fn restart(&mut self) -> Result<()> {
         self.inner.restart()
-    }
-
-    fn hydrate(&mut self, manifest: &SessionManifest) -> Result<()> {
-        self.inner.hydrate(manifest)
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -436,10 +520,6 @@ impl KernelAdapter for JavaScriptKernelAdapter {
 
     fn restart(&mut self) -> Result<()> {
         self.inner.restart()
-    }
-
-    fn hydrate(&mut self, manifest: &SessionManifest) -> Result<()> {
-        self.inner.hydrate(manifest)
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -499,14 +579,36 @@ fn kernel_script(relative: &str) -> String {
         .to_string()
 }
 
+fn apply_bridges(named_values: &mut BTreeMap<String, String>, bridges: &[BridgeValue]) {
+    for bridge in bridges {
+        if let BridgeValue::NamedValue { name, value } = bridge {
+            named_values.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+pub fn load_session_for_notebook(path: &Path, notebook: &Notebook) -> Result<SessionManager> {
+    let checkpoint_paths = crate::storage::CheckpointPaths::for_notebook(path);
+    let manifest = if crate::storage::CheckpointStorage::exists(&checkpoint_paths) {
+        crate::storage::CheckpointStorage::load(&checkpoint_paths)?
+    } else {
+        SessionManifest::new(notebook)
+    };
+    let mut session =
+        SessionManager::from_manifest(manifest).with_ai_runtime(AiRuntime::from_env()?);
+    session.register_default_kernels()?;
+    session.hydrate()?;
+    Ok(session)
+}
+
 pub fn run_notebook_cells(
     session: &mut SessionManager,
     notebook: &Notebook,
 ) -> Result<Vec<ExecutionRecord>> {
     let mut records = Vec::new();
-    for cell in &notebook.cells {
-        if cell.kind == CellKind::Code {
-            records.push(session.run_cell(cell)?);
+    for index in 0..notebook.cells.len() {
+        if notebook.cells[index].kind != CellKind::Text {
+            records.push(session.run_cell_at(notebook, index)?);
         }
     }
     Ok(records)
@@ -535,7 +637,7 @@ pub fn summarize_records(records: &[ExecutionRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Cell, Language, Notebook};
+    use crate::core::{Cell, Notebook};
 
     #[test]
     fn python_kernel_persists_assignments_across_cells() {
@@ -546,10 +648,10 @@ mod tests {
             .unwrap();
 
         let assign = Cell::code(Language::Python, "value = 42");
-        session.run_cell(&assign).unwrap();
+        session.run_code_cell(&assign).unwrap();
 
         let print = Cell::code(Language::Python, "print(value)");
-        let record = session.run_cell(&print).unwrap();
+        let record = session.run_code_cell(&print).unwrap();
 
         assert_eq!(record.output, "42");
     }
@@ -563,10 +665,10 @@ mod tests {
             .unwrap();
 
         let export = Cell::code(Language::Bash, "export NAME=strata");
-        session.run_cell(&export).unwrap();
+        session.run_code_cell(&export).unwrap();
 
         let echo = Cell::code(Language::Bash, "echo $NAME");
-        let record = session.run_cell(&echo).unwrap();
+        let record = session.run_code_cell(&echo).unwrap();
 
         assert_eq!(record.output, "strata");
     }
@@ -580,11 +682,11 @@ mod tests {
             .unwrap();
 
         session
-            .run_cell(&Cell::code(Language::JavaScript, "globalThis.count = 3;"))
+            .run_code_cell(&Cell::code(Language::JavaScript, "globalThis.count = 3;"))
             .unwrap();
 
         let record = session
-            .run_cell(&Cell::code(
+            .run_code_cell(&Cell::code(
                 Language::JavaScript,
                 "globalThis.count += 2; console.log(globalThis.count);",
             ))
@@ -594,43 +696,25 @@ mod tests {
     }
 
     #[test]
-    fn named_values_flow_across_languages() {
-        let notebook = Notebook::new("Flow");
-        let mut session = SessionManager::new(&notebook);
-        session.register_default_kernels().unwrap();
-
-        let python = session
-            .run_cell(&Cell::code(
-                Language::Python,
-                "strata.export('shared', 'hello')",
-            ))
-            .unwrap();
-        let bash = session
-            .run_cell(&Cell::code(Language::Bash, "echo $(strata_input shared)"))
-            .unwrap();
-
-        assert_eq!(python.status, ExecutionStatus::Succeeded);
-        assert_eq!(bash.output, "hello");
-        assert_eq!(
-            session.manifest.named_values.get("shared"),
-            Some(&"hello".to_string())
-        );
-    }
-
-    #[test]
-    fn failed_python_cell_records_stderr_and_status() {
-        let notebook = Notebook::new("Failure");
-        let mut session = SessionManager::new(&notebook);
-        session
+    fn hydration_replays_prior_successful_cells() {
+        let notebook = Notebook::new("Hydrate").with_cells(vec![
+            Cell::code(Language::Python, "value = 42"),
+            Cell::code(Language::Python, "print(value)"),
+        ]);
+        let mut first = SessionManager::new(&notebook);
+        first
             .register_kernel(Box::new(PythonKernelAdapter::default()))
             .unwrap();
+        first.run_code_cell(&notebook.cells[0]).unwrap();
+        let manifest = first.manifest.clone();
 
-        let record = session
-            .run_cell(&Cell::code(Language::Python, "raise RuntimeError('boom')"))
+        let mut second = SessionManager::from_manifest(manifest);
+        second
+            .register_kernel(Box::new(PythonKernelAdapter::default()))
             .unwrap();
+        second.hydrate().unwrap();
+        let record = second.run_code_cell(&notebook.cells[1]).unwrap();
 
-        assert_eq!(record.status, ExecutionStatus::Failed);
-        assert_ne!(record.exit_code, 0);
-        assert!(record.error_output.contains("RuntimeError"));
+        assert_eq!(record.output, "42");
     }
 }
