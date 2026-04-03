@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -92,6 +93,8 @@ pub enum CellKind {
 pub enum Language {
     Bash,
     Python,
+    JavaScript,
+    TypeScript,
     Text,
     Ai,
 }
@@ -101,6 +104,8 @@ impl Language {
         match self {
             Language::Bash => "bash",
             Language::Python => "python",
+            Language::JavaScript => "javascript",
+            Language::TypeScript => "typescript",
             Language::Text => "text",
             Language::Ai => "ai",
         }
@@ -194,6 +199,7 @@ pub struct ArtifactRef {
 pub enum BridgeValue {
     Stdout(String),
     Environment { key: String, value: String },
+    NamedValue { name: String, value: String },
     Artifact(ArtifactRef),
 }
 
@@ -202,6 +208,7 @@ pub struct ExecutionRequest {
     pub cell_id: CellId,
     pub language: Language,
     pub source: String,
+    pub named_values: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -216,8 +223,12 @@ pub enum ExecutionStatus {
 pub struct ExecutionRecord {
     pub id: ExecutionId,
     pub cell_id: CellId,
+    pub language: Language,
+    pub source: String,
     pub status: ExecutionStatus,
     pub output: String,
+    pub error_output: String,
+    pub exit_code: i32,
     pub dependencies: Vec<ArtifactRef>,
     pub bridges: Vec<BridgeValue>,
 }
@@ -226,6 +237,7 @@ pub struct ExecutionRecord {
 pub struct SessionManifest {
     pub session_id: SessionId,
     pub notebook_title: String,
+    pub named_values: BTreeMap<String, String>,
     pub execution_history: Vec<ExecutionRecord>,
     pub artifacts: Vec<ArtifactRef>,
 }
@@ -235,6 +247,7 @@ impl SessionManifest {
         Self {
             session_id: SessionId::new(),
             notebook_title: notebook.metadata.title.clone(),
+            named_values: BTreeMap::new(),
             execution_history: Vec::new(),
             artifacts: Vec::new(),
         }

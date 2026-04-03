@@ -85,6 +85,8 @@ fn label(language: Language) -> &'static str {
     match language {
         Language::Bash => "bash",
         Language::Python => "python",
+        Language::JavaScript => "javascript",
+        Language::TypeScript => "typescript",
         Language::Text => "text",
         Language::Ai => "ai",
     }

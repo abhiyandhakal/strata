@@ -164,6 +164,10 @@ impl NotebookStorage {
 pub struct CheckpointStorage;
 
 impl CheckpointStorage {
+    pub fn exists(paths: &CheckpointPaths) -> bool {
+        paths.manifest.exists()
+    }
+
     pub fn save(paths: &CheckpointPaths, manifest: &SessionManifest) -> Result<()> {
         fs::create_dir_all(&paths.artifacts).with_context(|| {
             format!(
@@ -227,6 +231,8 @@ fn parse_language(language: &str) -> Language {
     match language {
         "bash" | "sh" | "shell" => Language::Bash,
         "python" | "py" => Language::Python,
+        "javascript" | "js" => Language::JavaScript,
+        "typescript" | "ts" => Language::TypeScript,
         "ai" | "prompt" => Language::Ai,
         _ => Language::Text,
     }
@@ -265,5 +271,27 @@ mod tests {
         assert_eq!(parsed.cells[1].language, Language::Python);
         assert_eq!(parsed.cells[1].source, "value = 1\nprint(value)");
         assert_eq!(parsed.cells[2].kind, CellKind::Ai);
+    }
+
+    #[test]
+    fn markdown_parser_supports_javascript_and_typescript_fences() {
+        let raw = r#"# Demo
+
+<!-- strata:cell id=cell-0001 kind=code language=javascript -->
+```js
+console.log("hello")
+```
+
+<!-- strata:cell id=cell-0002 kind=code language=typescript -->
+```ts
+const value: number = 7;
+```
+"#;
+
+        let parsed = NotebookStorage::parse_markdown(raw).unwrap();
+
+        assert_eq!(parsed.cells.len(), 2);
+        assert_eq!(parsed.cells[0].language, Language::JavaScript);
+        assert_eq!(parsed.cells[1].language, Language::TypeScript);
     }
 }
