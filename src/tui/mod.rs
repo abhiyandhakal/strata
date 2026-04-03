@@ -672,7 +672,7 @@ impl App {
     }
 
     fn insert_cell(&mut self, language: Language) {
-        let next = self.selected.saturating_add(1);
+        let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
         self.notebook
             .cells
             .insert(next, Cell::code(language, String::new()));
@@ -682,7 +682,7 @@ impl App {
     }
 
     fn insert_ai_cell(&mut self) {
-        let next = self.selected.saturating_add(1);
+        let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
         self.notebook.cells.insert(next, Cell::ai(String::new()));
         self.selected = next;
         self.enter_edit_mode();
@@ -690,7 +690,7 @@ impl App {
     }
 
     fn insert_text_cell(&mut self) {
-        let next = self.selected.saturating_add(1);
+        let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
         self.notebook.cells.insert(next, Cell::text(String::new()));
         self.selected = next;
         self.enter_edit_mode();
@@ -993,5 +993,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.notebook.cells[0].source, "bc");
+    }
+
+    #[test]
+    fn inserting_into_empty_notebook_does_not_panic() {
+        let notebook = Notebook::new("Empty");
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.notebook.cells.len(), 1);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.notebook.cells[0].kind, CellKind::Ai);
     }
 }
