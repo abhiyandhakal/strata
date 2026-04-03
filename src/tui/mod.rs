@@ -174,6 +174,15 @@ impl VimState {
                         return VimTransition::Mode(VimMode::Normal);
                     }
                     Input {
+                        key: Key::Char('s'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Normal => {
+                        textarea.cancel_selection();
+                        textarea.delete_next_char();
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
                         key: Key::Char('i'),
                         ..
                     } => {
@@ -339,6 +348,15 @@ impl VimState {
                     }
                     Input {
                         key: Key::Char('c'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Visual => {
+                        textarea.move_cursor(CursorMove::Forward);
+                        textarea.cut();
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('s'),
                         ctrl: false,
                         ..
                     } if self.mode == VimMode::Visual => {
@@ -993,6 +1011,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.notebook.cells[0].source, "bc");
+    }
+
+    #[test]
+    fn vim_substitute_command_replaces_character_and_enters_insert_mode() {
+        let notebook = Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "abc")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, true);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.vim_mode(), Some(VimMode::Insert));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.notebook.cells[0].source, "zbc");
+    }
+
+    #[test]
+    fn vim_visual_substitute_replaces_selection() {
+        let notebook = Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "abcd")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, true);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.vim_mode(), Some(VimMode::Insert));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.notebook.cells[0].source, "zcd");
     }
 
     #[test]
