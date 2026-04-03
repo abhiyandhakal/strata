@@ -1,8 +1,9 @@
+use std::fmt;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -10,20 +11,384 @@ use crossterm::terminal::{
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 use crate::core::{Cell, CellKind, ExecutionStatus, Language, Notebook};
 use crate::runtime::SessionManager;
 use crate::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode {
+enum AppMode {
     Normal,
     Edit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VimMode {
+    Normal,
+    Insert,
+    Visual,
+    Operator(char),
+}
+
+impl fmt::Display for VimMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VimMode::Normal => write!(f, "NORMAL"),
+            VimMode::Insert => write!(f, "INSERT"),
+            VimMode::Visual => write!(f, "VISUAL"),
+            VimMode::Operator(op) => write!(f, "OPERATOR({op})"),
+        }
+    }
+}
+
+enum VimTransition {
+    Nop,
+    Mode(VimMode),
+    Pending(Input),
+}
+
+#[derive(Clone, Debug)]
+struct VimState {
+    mode: VimMode,
+    pending: Input,
+}
+
+impl VimState {
+    fn new(mode: VimMode) -> Self {
+        Self {
+            mode,
+            pending: Input::default(),
+        }
+    }
+
+    fn with_pending(self, pending: Input) -> Self {
+        Self {
+            mode: self.mode,
+            pending,
+        }
+    }
+
+    fn transition(&self, input: Input, textarea: &mut TextArea<'_>) -> VimTransition {
+        if input.key == Key::Null {
+            return VimTransition::Nop;
+        }
+
+        match self.mode {
+            VimMode::Normal | VimMode::Visual | VimMode::Operator(_) => {
+                match input {
+                    Input {
+                        key: Key::Char('h'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::Back),
+                    Input {
+                        key: Key::Char('j'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::Down),
+                    Input {
+                        key: Key::Char('k'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::Up),
+                    Input {
+                        key: Key::Char('l'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::Forward),
+                    Input {
+                        key: Key::Char('w'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::WordForward),
+                    Input {
+                        key: Key::Char('e'),
+                        ctrl: false,
+                        ..
+                    } => {
+                        textarea.move_cursor(CursorMove::WordEnd);
+                        if matches!(self.mode, VimMode::Operator(_)) {
+                            textarea.move_cursor(CursorMove::Forward);
+                        }
+                    }
+                    Input {
+                        key: Key::Char('b'),
+                        ctrl: false,
+                        ..
+                    } => textarea.move_cursor(CursorMove::WordBack),
+                    Input {
+                        key: Key::Char('^'),
+                        ..
+                    }
+                    | Input {
+                        key: Key::Char('0'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::Head),
+                    Input {
+                        key: Key::Char('$'),
+                        ..
+                    } => textarea.move_cursor(CursorMove::End),
+                    Input {
+                        key: Key::Char('D'),
+                        ..
+                    } => {
+                        textarea.delete_line_by_end();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('C'),
+                        ..
+                    } => {
+                        textarea.delete_line_by_end();
+                        textarea.cancel_selection();
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('p'),
+                        ..
+                    } => {
+                        textarea.paste();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('u'),
+                        ctrl: false,
+                        ..
+                    } => {
+                        textarea.undo();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('r'),
+                        ctrl: true,
+                        ..
+                    } => {
+                        textarea.redo();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('x'),
+                        ..
+                    } => {
+                        textarea.delete_next_char();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('i'),
+                        ..
+                    } => {
+                        textarea.cancel_selection();
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('a'),
+                        ..
+                    } => {
+                        textarea.cancel_selection();
+                        textarea.move_cursor(CursorMove::Forward);
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('A'),
+                        ..
+                    } => {
+                        textarea.cancel_selection();
+                        textarea.move_cursor(CursorMove::End);
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('o'),
+                        ..
+                    } => {
+                        textarea.move_cursor(CursorMove::End);
+                        textarea.insert_newline();
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('O'),
+                        ..
+                    } => {
+                        textarea.move_cursor(CursorMove::Head);
+                        textarea.insert_newline();
+                        textarea.move_cursor(CursorMove::Up);
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('I'),
+                        ..
+                    } => {
+                        textarea.cancel_selection();
+                        textarea.move_cursor(CursorMove::Head);
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    Input {
+                        key: Key::Char('e'),
+                        ctrl: true,
+                        ..
+                    } => textarea.scroll((1, 0)),
+                    Input {
+                        key: Key::Char('y'),
+                        ctrl: true,
+                        ..
+                    } => textarea.scroll((-1, 0)),
+                    Input {
+                        key: Key::Char('d'),
+                        ctrl: true,
+                        ..
+                    } => textarea.scroll(Scrolling::HalfPageDown),
+                    Input {
+                        key: Key::Char('u'),
+                        ctrl: true,
+                        ..
+                    } => textarea.scroll(Scrolling::HalfPageUp),
+                    Input {
+                        key: Key::Char('f'),
+                        ctrl: true,
+                        ..
+                    } => textarea.scroll(Scrolling::PageDown),
+                    Input {
+                        key: Key::Char('b'),
+                        ctrl: true,
+                        ..
+                    } => textarea.scroll(Scrolling::PageUp),
+                    Input {
+                        key: Key::Char('v'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Normal => {
+                        textarea.start_selection();
+                        return VimTransition::Mode(VimMode::Visual);
+                    }
+                    Input {
+                        key: Key::Char('V'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Normal => {
+                        textarea.move_cursor(CursorMove::Head);
+                        textarea.start_selection();
+                        textarea.move_cursor(CursorMove::End);
+                        return VimTransition::Mode(VimMode::Visual);
+                    }
+                    Input { key: Key::Esc, .. }
+                    | Input {
+                        key: Key::Char('v'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Visual => {
+                        textarea.cancel_selection();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('g'),
+                        ctrl: false,
+                        ..
+                    } if matches!(
+                        self.pending,
+                        Input {
+                            key: Key::Char('g'),
+                            ctrl: false,
+                            ..
+                        }
+                    ) =>
+                    {
+                        textarea.move_cursor(CursorMove::Top)
+                    }
+                    Input {
+                        key: Key::Char('G'),
+                        ctrl: false,
+                        ..
+                    } => textarea.move_cursor(CursorMove::Bottom),
+                    Input {
+                        key: Key::Char(c),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Operator(c) => {
+                        textarea.move_cursor(CursorMove::Head);
+                        textarea.start_selection();
+                        let cursor = textarea.cursor();
+                        textarea.move_cursor(CursorMove::Down);
+                        if cursor == textarea.cursor() {
+                            textarea.move_cursor(CursorMove::End);
+                        }
+                    }
+                    Input {
+                        key: Key::Char(op @ ('y' | 'd' | 'c')),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Normal => {
+                        textarea.start_selection();
+                        return VimTransition::Mode(VimMode::Operator(op));
+                    }
+                    Input {
+                        key: Key::Char('y'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Visual => {
+                        textarea.move_cursor(CursorMove::Forward);
+                        textarea.copy();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('d'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Visual => {
+                        textarea.move_cursor(CursorMove::Forward);
+                        textarea.cut();
+                        return VimTransition::Mode(VimMode::Normal);
+                    }
+                    Input {
+                        key: Key::Char('c'),
+                        ctrl: false,
+                        ..
+                    } if self.mode == VimMode::Visual => {
+                        textarea.move_cursor(CursorMove::Forward);
+                        textarea.cut();
+                        return VimTransition::Mode(VimMode::Insert);
+                    }
+                    input => return VimTransition::Pending(input),
+                }
+
+                match self.mode {
+                    VimMode::Operator('y') => {
+                        textarea.copy();
+                        VimTransition::Mode(VimMode::Normal)
+                    }
+                    VimMode::Operator('d') => {
+                        textarea.cut();
+                        VimTransition::Mode(VimMode::Normal)
+                    }
+                    VimMode::Operator('c') => {
+                        textarea.cut();
+                        VimTransition::Mode(VimMode::Insert)
+                    }
+                    _ => VimTransition::Nop,
+                }
+            }
+            VimMode::Insert => match input {
+                Input { key: Key::Esc, .. }
+                | Input {
+                    key: Key::Char('c'),
+                    ctrl: true,
+                    ..
+                } => VimTransition::Mode(VimMode::Normal),
+                input => {
+                    textarea.input(input);
+                    VimTransition::Mode(VimMode::Insert)
+                }
+            },
+        }
+    }
+
+    fn cursor_style(&self) -> Style {
+        let color = match self.mode {
+            VimMode::Normal => Color::Reset,
+            VimMode::Insert => Color::LightBlue,
+            VimMode::Visual => Color::LightYellow,
+            VimMode::Operator(_) => Color::LightGreen,
+        };
+        Style::default().fg(color).add_modifier(Modifier::REVERSED)
+    }
 }
 
 pub struct App {
@@ -33,8 +398,10 @@ pub struct App {
     notebook_path: Option<PathBuf>,
     checkpoint_paths: Option<CheckpointPaths>,
     pub session: SessionManager,
-    mode: Mode,
+    mode: AppMode,
     editor: TextArea<'static>,
+    vim_enabled: bool,
+    vim: Option<VimState>,
 }
 
 impl App {
@@ -42,6 +409,7 @@ impl App {
         notebook: Notebook,
         notebook_path: Option<PathBuf>,
         session: SessionManager,
+        vim_enabled: bool,
     ) -> Self {
         let checkpoint_paths = notebook_path
             .as_ref()
@@ -49,16 +417,17 @@ impl App {
         let mut app = Self {
             notebook,
             selected: 0,
-            status:
-                "normal: j/k move | e edit | r run | ctrl-s save | b/p/j/t/a add | x delete | q quit"
-                    .to_string(),
+            status: String::new(),
             notebook_path,
             checkpoint_paths,
             session,
-            mode: Mode::Normal,
+            mode: AppMode::Normal,
             editor: TextArea::default(),
+            vim_enabled,
+            vim: None,
         };
         app.load_selected_into_editor();
+        app.refresh_status();
         app
     }
 
@@ -80,8 +449,8 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         match self.mode {
-            Mode::Normal => self.handle_normal_mode(key),
-            Mode::Edit => self.handle_edit_mode(key),
+            AppMode::Normal => self.handle_normal_mode(key),
+            AppMode::Edit => self.handle_edit_mode(key),
         }
     }
 
@@ -90,10 +459,7 @@ impl App {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Char('e') => {
-                self.mode = Mode::Edit;
-                self.status = "edit: Esc finish | ctrl-s save | ctrl-r run".to_string();
-            }
+            KeyCode::Char('e') => self.enter_edit_mode(),
             KeyCode::Char('r') => self.run_selected_cell()?,
             KeyCode::Char('b') => self.insert_cell(Language::Bash),
             KeyCode::Char('p') => self.insert_cell(Language::Python),
@@ -102,6 +468,7 @@ impl App {
             KeyCode::Char('a') => self.insert_ai_cell(),
             KeyCode::Char('n') => self.insert_text_cell(),
             KeyCode::Char('x') => self.delete_selected_cell(),
+            KeyCode::Char('v') => self.toggle_vim_mode(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.save_all()?
             }
@@ -122,10 +489,36 @@ impl App {
             self.run_selected_cell()?;
             return Ok(false);
         }
+
+        if self.vim_enabled {
+            if key.code == KeyCode::Esc && matches!(self.vim_mode(), Some(VimMode::Normal)) {
+                self.apply_editor_to_cell();
+                self.mode = AppMode::Normal;
+                self.vim = None;
+                self.sync_editor_presentation();
+                self.refresh_status();
+                return Ok(false);
+            }
+
+            let input = input_from_key_event(key);
+            let Some(vim) = self.vim.clone() else {
+                bail!("vim mode enabled without editor state");
+            };
+            let transition = vim.transition(input, &mut self.editor);
+            self.vim = match transition {
+                VimTransition::Mode(mode) => Some(VimState::new(mode)),
+                VimTransition::Pending(input) => Some(vim.with_pending(input)),
+                VimTransition::Nop => Some(vim),
+            };
+            self.sync_editor_presentation();
+            self.refresh_status();
+            return Ok(false);
+        }
+
         if key.code == KeyCode::Esc {
             self.apply_editor_to_cell();
-            self.mode = Mode::Normal;
-            self.status = "normal: j/k move | e edit | r run | ctrl-s save | b/p/j/t/a add | x delete | q quit".to_string();
+            self.mode = AppMode::Normal;
+            self.refresh_status();
             return Ok(false);
         }
 
@@ -188,23 +581,7 @@ impl App {
         );
         frame.render_widget(list, body[0]);
 
-        self.editor.set_block(
-            Block::default()
-                .title(format!(
-                    "{} {:?}",
-                    if self.mode == Mode::Edit {
-                        "Editing"
-                    } else {
-                        "Cell"
-                    },
-                    self.notebook
-                        .cells
-                        .get(self.selected)
-                        .map(|cell| cell.language)
-                        .unwrap_or(Language::Text)
-                ))
-                .borders(Borders::ALL),
-        );
+        self.sync_editor_presentation();
         frame.render_widget(&self.editor, body[1]);
 
         let output = self.render_output();
@@ -213,7 +590,7 @@ impl App {
         let status = Paragraph::new(self.status.as_str())
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(Line::styled(
-                format!("Status [{:?}]", self.mode),
+                self.status_title(),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
         frame.render_widget(status, chunks[1]);
@@ -274,6 +651,7 @@ impl App {
         let next = (self.selected as isize + delta).clamp(0, max_index) as usize;
         self.selected = next;
         self.load_selected_into_editor();
+        self.refresh_status();
     }
 
     fn load_selected_into_editor(&mut self) {
@@ -281,8 +659,10 @@ impl App {
         if let Some(cell) = self.notebook.cells.get(self.selected) {
             self.editor = TextArea::from(cell.source.lines().map(|line| line.to_string()));
         }
-        self.editor
-            .set_cursor_line_style(Style::default().add_modifier(Modifier::REVERSED));
+        if self.mode == AppMode::Edit && self.vim_enabled {
+            self.vim = Some(VimState::new(VimMode::Normal));
+        }
+        self.sync_editor_presentation();
     }
 
     fn apply_editor_to_cell(&mut self) {
@@ -297,8 +677,7 @@ impl App {
             .cells
             .insert(next, Cell::code(language, String::new()));
         self.selected = next;
-        self.mode = Mode::Edit;
-        self.load_selected_into_editor();
+        self.enter_edit_mode();
         self.status = format!("inserted {} cell", language.fence_name());
     }
 
@@ -306,8 +685,7 @@ impl App {
         let next = self.selected.saturating_add(1);
         self.notebook.cells.insert(next, Cell::ai(String::new()));
         self.selected = next;
-        self.mode = Mode::Edit;
-        self.load_selected_into_editor();
+        self.enter_edit_mode();
         self.status = "inserted ai cell".to_string();
     }
 
@@ -315,8 +693,7 @@ impl App {
         let next = self.selected.saturating_add(1);
         self.notebook.cells.insert(next, Cell::text(String::new()));
         self.selected = next;
-        self.mode = Mode::Edit;
-        self.load_selected_into_editor();
+        self.enter_edit_mode();
         self.status = "inserted text cell".to_string();
     }
 
@@ -363,9 +740,111 @@ impl App {
             record.cell_id, record.status, record.exit_code
         );
         if record.status == ExecutionStatus::Failed {
-            self.mode = Mode::Normal;
+            self.mode = AppMode::Normal;
+            self.vim = None;
+            self.sync_editor_presentation();
         }
         Ok(())
+    }
+
+    fn enter_edit_mode(&mut self) {
+        self.mode = AppMode::Edit;
+        self.vim = if self.vim_enabled {
+            Some(VimState::new(VimMode::Normal))
+        } else {
+            None
+        };
+        self.load_selected_into_editor();
+        self.refresh_status();
+    }
+
+    fn toggle_vim_mode(&mut self) {
+        self.vim_enabled = !self.vim_enabled;
+        self.vim = None;
+        self.sync_editor_presentation();
+        self.refresh_status();
+        self.status = if self.vim_enabled {
+            "vim mode enabled for this session".to_string()
+        } else {
+            "vim mode disabled for this session".to_string()
+        };
+    }
+
+    fn vim_mode(&self) -> Option<VimMode> {
+        self.vim.as_ref().map(|vim| vim.mode)
+    }
+
+    fn sync_editor_presentation(&mut self) {
+        let title = self.editor_title();
+        self.editor
+            .set_block(Block::default().title(title).borders(Borders::ALL));
+        self.editor
+            .set_cursor_line_style(Style::default().add_modifier(Modifier::REVERSED));
+        let cursor_style = match self.vim.as_ref() {
+            Some(vim) => vim.cursor_style(),
+            None => Style::default().add_modifier(Modifier::REVERSED),
+        };
+        self.editor.set_cursor_style(cursor_style);
+    }
+
+    fn editor_title(&self) -> String {
+        let prefix = if self.mode == AppMode::Edit {
+            "Editing"
+        } else {
+            "Cell"
+        };
+        let language = self
+            .notebook
+            .cells
+            .get(self.selected)
+            .map(|cell| cell.language.fence_name())
+            .unwrap_or("text");
+        match self.vim_mode() {
+            Some(mode) => format!("{prefix} {language} [VIM {mode}]"),
+            None if self.vim_enabled => format!("{prefix} {language} [VIM READY]"),
+            None => format!("{prefix} {language}"),
+        }
+    }
+
+    fn status_title(&self) -> String {
+        match self.vim_mode() {
+            Some(mode) => format!("Status [{:?} | VIM {mode}]", self.mode),
+            None => format!(
+                "Status [{:?} | {}]",
+                self.mode,
+                if self.vim_enabled {
+                    "VIM ON"
+                } else {
+                    "VIM OFF"
+                }
+            ),
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        self.status = match (self.mode, self.vim_mode(), self.vim_enabled) {
+            (AppMode::Normal, _, true) => {
+                "normal: j/k move | e edit | v toggle vim | r run | ctrl-s save | b/p/J/t/a/n add | x delete | q quit".to_string()
+            }
+            (AppMode::Normal, _, false) => {
+                "normal: j/k move | e edit | v toggle vim | r run | ctrl-s save | b/p/J/t/a/n add | x delete | q quit".to_string()
+            }
+            (AppMode::Edit, Some(VimMode::Normal), _) => {
+                "edit vim NORMAL: i/a/o enter insert | v visual | Esc exit editor | ctrl-s save | ctrl-r run".to_string()
+            }
+            (AppMode::Edit, Some(VimMode::Insert), _) => {
+                "edit vim INSERT: Esc normal | ctrl-s save | ctrl-r run".to_string()
+            }
+            (AppMode::Edit, Some(VimMode::Visual), _) => {
+                "edit vim VISUAL: y copy | d delete | c change | Esc normal | ctrl-s save | ctrl-r run".to_string()
+            }
+            (AppMode::Edit, Some(VimMode::Operator(_)), _) => {
+                "edit vim OPERATOR: motion applies pending operator | Esc normal | ctrl-s save | ctrl-r run".to_string()
+            }
+            (AppMode::Edit, None, _) => {
+                "edit: Esc finish | ctrl-s save | ctrl-r run".to_string()
+            }
+        };
     }
 }
 
@@ -409,7 +888,7 @@ mod tests {
         let notebook =
             Notebook::new("Edit").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session);
+        let mut app = App::new(notebook, None, session, false);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
             .unwrap();
@@ -423,6 +902,7 @@ mod tests {
             .unwrap();
 
         assert!(app.notebook.cells[0].source.contains('#'));
+        assert_eq!(app.mode, AppMode::Normal);
     }
 
     #[test]
@@ -431,11 +911,87 @@ mod tests {
         let path = temp.path().join("demo.md");
         let notebook = Notebook::new("Save").with_cells(vec![Cell::text("hello")]);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, Some(path.clone()), session);
+        let mut app = App::new(notebook, Some(path.clone()), session, false);
 
         app.save_all().unwrap();
 
         let saved = std::fs::read_to_string(path).unwrap();
         assert!(saved.contains("# Save"));
+    }
+
+    #[test]
+    fn vim_mode_can_be_toggled_in_session() {
+        let notebook = Notebook::new("Vim").with_cells(vec![Cell::text("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.vim_enabled);
+        assert!(app.status.contains("vim mode enabled"));
+    }
+
+    #[test]
+    fn vim_mode_enters_normal_and_requires_double_escape_to_exit() {
+        let notebook =
+            Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, true);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.vim_mode(), Some(VimMode::Normal));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.vim_mode(), Some(VimMode::Insert));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, AppMode::Edit);
+        assert_eq!(app.vim_mode(), Some(VimMode::Normal));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.vim_mode(), None);
+    }
+
+    #[test]
+    fn vim_insert_appends_text_after_entering_insert_mode() {
+        let notebook =
+            Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, true);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.notebook.cells[0].source.ends_with('#'));
+    }
+
+    #[test]
+    fn vim_delete_command_edits_buffer_in_normal_mode() {
+        let notebook = Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "abc")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, true);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.notebook.cells[0].source, "bc");
     }
 }

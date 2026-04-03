@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use strata::ai::AiRuntime;
+use strata::config::StrataConfig;
 use strata::core::{Cell, Language, Notebook};
 use strata::runtime::{
     SessionManager, load_session_for_notebook, run_notebook_cells, summarize_records,
@@ -35,6 +36,7 @@ fn main() -> Result<()> {
 }
 
 fn open_command(path: Option<PathBuf>) -> Result<()> {
+    let config = StrataConfig::load()?;
     let (notebook, notebook_path, session) = match path {
         Some(path) => {
             let notebook = NotebookStorage::load_markdown(&path)?;
@@ -49,7 +51,7 @@ fn open_command(path: Option<PathBuf>) -> Result<()> {
     };
 
     if should_launch_tui() {
-        App::new(notebook, notebook_path, session).run()?;
+        App::new(notebook, notebook_path, session, config.editor.vim_mode).run()?;
     } else {
         println!("{}", NotebookStorage::render_markdown(&notebook));
     }
