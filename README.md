@@ -59,6 +59,7 @@ If `STRATA_AI_PROVIDER` is unset, Strata picks the first configured provider. If
 When opening a notebook in a real terminal, Strata launches the TUI. Current key workflow:
 
 - `j` / `k`: move between cells
+- `v`: toggle vim mode for the current TUI session
 - `e`: edit selected cell
 - `Esc`: leave edit mode and keep changes in memory
 - `Ctrl-S`: save the notebook and checkpoint
@@ -69,6 +70,40 @@ When opening a notebook in a real terminal, Strata launches the TUI. Current key
 - `q`: quit
 
 The right pane shows the latest output or error for the selected cell, including AI responses and provider/model metadata when available.
+
+## Vim mode
+
+Strata now supports an opt-in vim editor mode for the cell editor only. Notebook navigation outside editing keeps the regular Strata keymap.
+
+Default configuration can come from TOML:
+
+```toml
+# ~/.config/strata/config.toml
+[editor]
+vim_mode = true
+```
+
+Override config file discovery if needed:
+
+```bash
+export STRATA_CONFIG_PATH=/path/to/config.toml
+```
+
+Override vim mode directly from the environment:
+
+```bash
+export STRATA_VIM_MODE=1
+```
+
+When vim mode is enabled and you press `e`, the editor starts in vim `NORMAL` mode. Key behavior:
+
+- `i`, `a`, `A`, `I`, `o`, `O`: enter insert mode
+- `Esc`: return to vim `NORMAL`; pressing `Esc` again in vim `NORMAL` exits editor mode back to notebook mode
+- `h`, `j`, `k`, `l`, `w`, `b`, `e`, `0`, `^`, `$`: movement
+- `v`, `V`: visual selection
+- `x`, `dd`, `yy`, `p`, `u`, `Ctrl-R`: common editing operations
+
+Notebook-level `q`, `r`, insert-cell shortcuts, and save/run bindings remain outside the vim editor scope.
 
 ## Resume behavior
 
