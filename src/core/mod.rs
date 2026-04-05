@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,93 @@ impl Language {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelKind {
+    Python,
+    Bash,
+    JavaScript,
+}
+
+impl KernelKind {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Python => "Python",
+            Self::Bash => "Bash",
+            Self::JavaScript => "JavaScript",
+        }
+    }
+
+    pub fn kernelspec(self) -> Kernelspec {
+        match self {
+            Self::Python => Kernelspec {
+                display_name: "Python 3".to_string(),
+                language: "python".to_string(),
+                name: "python3".to_string(),
+            },
+            Self::Bash => Kernelspec {
+                display_name: "Bash".to_string(),
+                language: "bash".to_string(),
+                name: "bash".to_string(),
+            },
+            Self::JavaScript => Kernelspec {
+                display_name: "JavaScript".to_string(),
+                language: "javascript".to_string(),
+                name: "javascript".to_string(),
+            },
+        }
+    }
+
+    pub fn language_info(self) -> LanguageInfo {
+        match self {
+            Self::Python => LanguageInfo::default(),
+            Self::Bash => LanguageInfo {
+                name: "bash".to_string(),
+                version: None,
+                mimetype: Some("application/x-sh".to_string()),
+                file_extension: Some(".sh".to_string()),
+            },
+            Self::JavaScript => LanguageInfo {
+                name: "javascript".to_string(),
+                version: None,
+                mimetype: Some("application/javascript".to_string()),
+                file_extension: Some(".js".to_string()),
+            },
+        }
+    }
+
+    pub fn language(self) -> Language {
+        match self {
+            Self::Python => Language::Python,
+            Self::Bash => Language::Bash,
+            Self::JavaScript => Language::JavaScript,
+        }
+    }
+}
+
+impl Default for KernelKind {
+    fn default() -> Self {
+        Self::Python
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NotebookRuntime {
+    #[serde(default)]
+    pub kernel: KernelKind,
+    #[serde(default)]
+    pub environment: String,
+}
+
+impl Default for NotebookRuntime {
+    fn default() -> Self {
+        Self {
+            kernel: KernelKind::Python,
+            environment: "system".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Kernelspec {
     pub display_name: String,
@@ -162,6 +250,8 @@ pub struct NotebookMetadata {
     pub kernelspec: Kernelspec,
     #[serde(default)]
     pub language_info: LanguageInfo,
+    #[serde(default)]
+    pub runtime: NotebookRuntime,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -173,6 +263,7 @@ impl Default for NotebookMetadata {
             description: None,
             kernelspec: Kernelspec::default(),
             language_info: LanguageInfo::default(),
+            runtime: NotebookRuntime::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -221,6 +312,62 @@ impl CellOutput {
             }
         }
     }
+
+    pub fn image_info(&self) -> Option<ImageOutput> {
+        let (data, metadata, execution_count) = match self {
+            CellOutput::ExecuteResult {
+                data,
+                metadata,
+                execution_count,
+            } => (data, metadata, Some(*execution_count)),
+            CellOutput::DisplayData { data, metadata } => (data, metadata, None),
+            _ => return None,
+        };
+
+        let mime = ["image/png", "image/jpeg", "image/svg+xml", "image/gif"]
+            .into_iter()
+            .find(|mime| data.contains_key(*mime))
+            .map(str::to_string)
+            .or_else(|| {
+                metadata
+                    .get("strata_image_mime")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })?;
+
+        let data_value = data.get(&mime).cloned();
+        let path = metadata
+            .get("strata_image_path")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let alt = data
+            .get("text/plain")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                metadata
+                    .get("strata_image_alt")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+
+        Some(ImageOutput {
+            mime,
+            data: data_value,
+            path,
+            alt,
+            execution_count,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageOutput {
+    pub mime: String,
+    pub data: Option<Value>,
+    pub path: Option<String>,
+    pub alt: Option<String>,
+    pub execution_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -324,6 +471,17 @@ impl Notebook {
     pub fn with_cells(mut self, cells: Vec<Cell>) -> Self {
         self.cells = cells;
         self
+    }
+
+    pub fn display_title(&self, path: Option<&Path>) -> String {
+        if self.metadata.title == "Untitled Notebook" {
+            if let Some(path) = path {
+                if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                    return stem.to_string();
+                }
+            }
+        }
+        self.metadata.title.clone()
     }
 }
 
@@ -460,5 +618,21 @@ fn render_json_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn untitled_notebook_uses_file_stem_for_display_title() {
+        let notebook = Notebook::new("Untitled Notebook");
+
+        assert_eq!(
+            notebook.display_title(Some(Path::new("/tmp/report.smd"))),
+            "report"
+        );
     }
 }

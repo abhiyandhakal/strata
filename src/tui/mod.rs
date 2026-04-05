@@ -22,9 +22,9 @@ use ratatui::{Frame, Terminal};
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 use crate::core::{
-    Cell, CellKind, CellOutput, CellUiState, ExecutionStatus, Language, Notebook,
+    Cell, CellKind, CellOutput, CellUiState, ExecutionStatus, KernelKind, Language, Notebook,
 };
-use crate::runtime::SessionManager;
+use crate::runtime::{EnvironmentOption, SessionManager, discover_environments};
 use crate::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
 use crate::theme::Theme;
 use crate::tooling::{PythonLspClient, PythonLspStatus, SyntaxHighlighter};
@@ -427,6 +427,8 @@ enum HitTarget {
     ToolbarSave,
     ToolbarRunAll,
     ToolbarRestart,
+    ToolbarCycleKernel,
+    ToolbarCycleEnvironment,
     ToolbarAddCode,
     ToolbarAddMarkdown,
     CellSelect(usize),
@@ -435,6 +437,7 @@ enum HitTarget {
     CellEdit(usize),
     CellToggleRender(usize),
     CellToggleOutput(usize),
+    CellOpenImage(usize),
     CellInsertBelow(usize),
     CellDelete(usize),
 }
@@ -555,6 +558,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('e') | KeyCode::Enter => self.enter_edit_mode(),
+            KeyCode::Char('K') => self.cycle_kernel()?,
+            KeyCode::Char('E') => self.cycle_environment()?,
+            KeyCode::Char('x') => self.open_selected_image()?,
             KeyCode::Char('r') => self.run_selected_cell()?,
             KeyCode::Char('R') => self.run_all_cells()?,
             KeyCode::Char('c') => self.insert_code_cell(),
@@ -745,10 +751,13 @@ impl App {
     }
 
     fn draw_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let display_title = self.notebook.display_title(self.notebook_path.as_deref());
+        let kernel_label = self.notebook.metadata.runtime.kernel.display_name();
+        let environment_label = self.current_environment_label();
         let title = Line::from(vec![
             Span::raw(format!(
-                "{} | kernel={} | mode={:?} | ",
-                self.notebook.metadata.title, self.notebook.metadata.kernelspec.display_name, self.mode
+                "{} | kernel={} | env={} | mode={:?} | ",
+                display_title, kernel_label, environment_label, self.mode
             )),
             Span::styled(self.python_lsp.summary(), self.python_lsp_style()),
             Span::raw(format!(" | theme={}", self.theme.name())),
@@ -765,12 +774,24 @@ impl App {
             width: area.width.saturating_sub(2),
             height: area.height.saturating_sub(2),
         };
+        let kernel_button = format!("[Kernel: {kernel_label}]");
+        let environment_button = format!("[Env: {environment_label}]");
         let mut spans = vec![
             Span::styled("[Save]", self.theme.style("toolbar.button.save")),
             Span::raw(" "),
             Span::styled("[Run All]", self.theme.style("toolbar.button.run_all")),
             Span::raw(" "),
             Span::styled("[Restart]", self.theme.style("toolbar.button.restart")),
+            Span::raw(" "),
+            Span::styled(
+                kernel_button.clone(),
+                self.theme.style("toolbar.button.add_code"),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                environment_button.clone(),
+                self.theme.style("toolbar.button.add_markdown"),
+            ),
             Span::raw(" "),
             Span::styled("[+ Code]", self.theme.style("toolbar.button.add_code")),
             Span::raw(" "),
@@ -780,12 +801,14 @@ impl App {
         frame.render_widget(toolbar, inner);
 
         let mut x = inner.x;
-        for (label, target) in [
-            ("[Save]", HitTarget::ToolbarSave),
-            ("[Run All]", HitTarget::ToolbarRunAll),
-            ("[Restart]", HitTarget::ToolbarRestart),
-            ("[+ Code]", HitTarget::ToolbarAddCode),
-            ("[+ Markdown]", HitTarget::ToolbarAddMarkdown),
+        for (label, target) in vec![
+            ("[Save]".to_string(), HitTarget::ToolbarSave),
+            ("[Run All]".to_string(), HitTarget::ToolbarRunAll),
+            ("[Restart]".to_string(), HitTarget::ToolbarRestart),
+            (kernel_button, HitTarget::ToolbarCycleKernel),
+            (environment_button, HitTarget::ToolbarCycleEnvironment),
+            ("[+ Code]".to_string(), HitTarget::ToolbarAddCode),
+            ("[+ Markdown]".to_string(), HitTarget::ToolbarAddMarkdown),
         ] {
             self.hit_regions.push(HitRegion {
                 rect: Rect {
@@ -886,8 +909,11 @@ impl App {
         };
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
         let mut chrome_spans = vec![Span::styled(prompt, chrome_style), Span::raw(" ")];
-        if is_executable(cell) {
+        if self.is_cell_runnable(cell) {
             chrome_spans.push(Span::styled("[Run]", self.theme.style("cell.button.run")));
+            chrome_spans.push(Span::raw(" "));
+        } else if matches!(cell.kind, CellKind::Code) {
+            chrome_spans.push(Span::styled("[Unsupported]", self.theme.style("output.error.label")));
             chrome_spans.push(Span::raw(" "));
         }
         chrome_spans.push(Span::styled(
@@ -906,6 +932,10 @@ impl App {
         if !cell.outputs.is_empty() {
             chrome_spans.push(Span::raw(" "));
             chrome_spans.push(Span::styled("[Out]", self.theme.style("cell.button.output")));
+            if self.first_image_output(cell).is_some() {
+                chrome_spans.push(Span::raw(" "));
+                chrome_spans.push(Span::styled("[Open]", self.theme.style("toolbar.button.add_markdown")));
+            }
         }
         let chrome = Line::from(chrome_spans);
         let chrome_area = Rect {
@@ -1105,6 +1135,16 @@ impl App {
 
     fn run_selected_cell(&mut self) -> Result<()> {
         self.apply_editor_to_cell();
+        if let Some(cell) = self.notebook.cells.get(self.selected) {
+            if !self.is_cell_runnable(cell) {
+                self.status = format!(
+                    "cell is not runnable under kernel={} env={}",
+                    self.notebook.metadata.runtime.kernel.display_name(),
+                    self.current_environment_label()
+                );
+                return Ok(());
+            }
+        }
         let record = self.session.run_cell_at(&mut self.notebook, self.selected)?;
         self.save_checkpoint_only()?;
         self.status = format!(
@@ -1122,7 +1162,7 @@ impl App {
     fn run_all_cells(&mut self) -> Result<()> {
         self.apply_editor_to_cell();
         for index in 0..self.notebook.cells.len() {
-            if matches!(self.notebook.cells[index].kind, CellKind::Code | CellKind::Ai) {
+            if self.is_cell_runnable(&self.notebook.cells[index]) {
                 self.selected = index;
                 self.session.run_cell_at(&mut self.notebook, index)?;
             }
@@ -1135,6 +1175,40 @@ impl App {
     fn restart_runtime(&mut self) -> Result<()> {
         self.session.restart_all()?;
         self.status = "restarted notebook runtime".to_string();
+        Ok(())
+    }
+
+    fn cycle_kernel(&mut self) -> Result<()> {
+        self.notebook.metadata.runtime.kernel = match self.notebook.metadata.runtime.kernel {
+            KernelKind::Python => KernelKind::Bash,
+            KernelKind::Bash => KernelKind::JavaScript,
+            KernelKind::JavaScript => KernelKind::Python,
+        };
+        self.notebook.metadata.kernelspec = self.notebook.metadata.runtime.kernel.kernelspec();
+        self.notebook.metadata.language_info = self.notebook.metadata.runtime.kernel.language_info();
+        if self.notebook.metadata.runtime.kernel != KernelKind::Python
+            && self.notebook.metadata.runtime.environment != "none"
+        {
+            self.notebook.metadata.runtime.environment = "system".to_string();
+        }
+        self.reconfigure_runtime()?;
+        self.status = format!(
+            "kernel set to {}",
+            self.notebook.metadata.runtime.kernel.display_name()
+        );
+        Ok(())
+    }
+
+    fn cycle_environment(&mut self) -> Result<()> {
+        let options = self.current_environment_options();
+        let current = options
+            .iter()
+            .position(|option| option.id == self.notebook.metadata.runtime.environment)
+            .unwrap_or(1.min(options.len().saturating_sub(1)));
+        let next = (current + 1) % options.len();
+        self.notebook.metadata.runtime.environment = options[next].id.clone();
+        self.reconfigure_runtime()?;
+        self.status = format!("environment set to {}", options[next].label);
         Ok(())
     }
 
@@ -1188,6 +1262,9 @@ impl App {
     }
 
     fn activate_python_lsp(&mut self) {
+        if self.notebook.metadata.runtime.kernel != KernelKind::Python {
+            return;
+        }
         if self.python_lsp_client.is_some() {
             return;
         }
@@ -1244,6 +1321,8 @@ impl App {
             HitTarget::ToolbarSave => self.save_all()?,
             HitTarget::ToolbarRunAll => self.run_all_cells()?,
             HitTarget::ToolbarRestart => self.restart_runtime()?,
+            HitTarget::ToolbarCycleKernel => self.cycle_kernel()?,
+            HitTarget::ToolbarCycleEnvironment => self.cycle_environment()?,
             HitTarget::ToolbarAddCode => self.insert_code_cell(),
             HitTarget::ToolbarAddMarkdown => self.insert_markdown_cell(),
             HitTarget::CellSelect(index) => {
@@ -1276,6 +1355,10 @@ impl App {
             HitTarget::CellToggleOutput(index) => {
                 self.selected = index;
                 self.toggle_output_for_selected();
+            }
+            HitTarget::CellOpenImage(index) => {
+                self.selected = index;
+                self.open_selected_image()?;
             }
             HitTarget::CellInsertBelow(index) => {
                 self.selected = index;
@@ -1310,7 +1393,7 @@ impl App {
 
     fn register_cell_chrome_hits(&mut self, chrome_area: Rect, index: usize, cell: &Cell, rendered: bool) {
         let mut labels = Vec::new();
-        if is_executable(cell) {
+        if self.is_cell_runnable(cell) {
             labels.push(("[Run]", HitTarget::CellRun(index)));
         }
         labels.push((
@@ -1330,6 +1413,9 @@ impl App {
         labels.push(("[Del]", HitTarget::CellDelete(index)));
         if !cell.outputs.is_empty() {
             labels.push(("[Out]", HitTarget::CellToggleOutput(index)));
+            if self.first_image_output(cell).is_some() {
+                labels.push(("[Open]", HitTarget::CellOpenImage(index)));
+            }
         }
 
         let mut x = chrome_area.x + prompt_width(cell);
@@ -1500,6 +1586,62 @@ impl App {
             PythonLspStatus::Unavailable => self.theme.style("lsp.unavailable"),
         }
     }
+
+    fn current_environment_options(&self) -> Vec<EnvironmentOption> {
+        discover_environments(
+            self.notebook_path.as_deref(),
+            self.notebook.metadata.runtime.kernel,
+        )
+    }
+
+    fn current_environment_label(&self) -> String {
+        self.current_environment_options()
+            .into_iter()
+            .find(|option| option.id == self.notebook.metadata.runtime.environment)
+            .map(|option| option.label)
+            .unwrap_or_else(|| self.notebook.metadata.runtime.environment.clone())
+    }
+
+    fn reconfigure_runtime(&mut self) -> Result<()> {
+        self.session
+            .configure_for_notebook(&self.notebook, self.notebook_path.as_deref())?;
+        self.python_lsp_client = None;
+        self.python_lsp = PythonLspStatus::detect();
+        self.activate_python_lsp();
+        Ok(())
+    }
+
+    fn is_cell_runnable(&self, cell: &Cell) -> bool {
+        match cell.kind {
+            CellKind::Ai => true,
+            CellKind::Code => {
+                self.notebook.metadata.runtime.environment != "none"
+                    && cell.language == self.notebook.metadata.runtime.kernel.language()
+            }
+            _ => false,
+        }
+    }
+
+    fn first_image_output<'a>(&self, cell: &'a Cell) -> Option<&'a CellOutput> {
+        cell.outputs.iter().find(|output| output.image_info().is_some())
+    }
+
+    fn open_selected_image(&mut self) -> Result<()> {
+        let Some(cell) = self.notebook.cells.get(self.selected) else {
+            return Ok(());
+        };
+        let Some(output) = self.first_image_output(cell) else {
+            self.status = "selected cell has no image output".to_string();
+            return Ok(());
+        };
+        let Some(path) = resolve_image_output_path(output, self.notebook_path.as_deref()) else {
+            self.status = "image output has no materialized file path yet".to_string();
+            return Ok(());
+        };
+        open_path_with_system(&path)?;
+        self.status = format!("opened image {}", path.display());
+        Ok(())
+    }
 }
 
 pub fn should_launch_tui() -> bool {
@@ -1641,6 +1783,20 @@ fn render_code_block(cell: &Cell, theme: &Theme) -> Text<'static> {
 fn render_output_block(cell: &Cell, theme: &Theme) -> Text<'static> {
     let mut lines = Vec::new();
     for output in &cell.outputs {
+        if let Some(image) = output.image_info() {
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "Image [{}] {}",
+                    image.mime,
+                    image.alt.unwrap_or_else(|| "open with [Open]".to_string())
+                ),
+                theme.style("output.stream.label"),
+            )]));
+            if let Some(path) = image.path {
+                lines.push(Line::from(path));
+            }
+            continue;
+        }
         match output {
             CellOutput::Stream { name, text } => {
                 lines.push(Line::from(vec![Span::styled(
@@ -1697,15 +1853,43 @@ fn render_output_block(cell: &Cell, theme: &Theme) -> Text<'static> {
     Text::from(lines)
 }
 
+fn resolve_image_output_path(output: &CellOutput, notebook_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    let image = output.image_info()?;
+    let path = image.path?;
+    let path_buf = PathBuf::from(&path);
+    if path_buf.is_absolute() {
+        Some(path_buf)
+    } else {
+        notebook_path
+            .and_then(std::path::Path::parent)
+            .map(|parent| parent.join(path))
+    }
+}
+
+fn open_path_with_system(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", &path.display().to_string()]);
+        command
+    };
+    #[cfg(not(target_os = "windows"))]
+    command.arg(path);
+    command
+        .spawn()
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(())
+}
+
 fn contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
-}
-
-fn is_executable(cell: &Cell) -> bool {
-    matches!(cell.kind, CellKind::Code | CellKind::Ai)
 }
 
 fn prompt_width(cell: &Cell) -> u16 {
@@ -1827,9 +2011,9 @@ mod tests {
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
-        let result = app.run_selected_cell();
+        app.run_selected_cell().unwrap();
 
-        assert!(result.is_err());
+        assert!(app.status.contains("not runnable"));
     }
 
     #[test]

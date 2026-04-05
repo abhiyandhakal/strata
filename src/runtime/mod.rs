@@ -9,9 +9,41 @@ use serde::{Deserialize, Serialize};
 use crate::ai::AiRuntime;
 use crate::core::{
     ArtifactId, ArtifactRef, BridgeValue, Cell, CellKind, CellOutput, ExecutionId,
-    ExecutionRecord, ExecutionRequest, ExecutionStatus, Language, Notebook, SessionId,
-    SessionManifest,
+    ExecutionRecord, ExecutionRequest, ExecutionStatus, KernelKind, Language, Notebook,
+    SessionId, SessionManifest,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnvironmentKind {
+    None,
+    System,
+    PythonInterpreter(PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentOption {
+    pub id: String,
+    pub label: String,
+    pub kind: EnvironmentKind,
+}
+
+impl EnvironmentOption {
+    pub fn none() -> Self {
+        Self {
+            id: "none".to_string(),
+            label: "None".to_string(),
+            kind: EnvironmentKind::None,
+        }
+    }
+
+    pub fn system() -> Self {
+        Self {
+            id: "system".to_string(),
+            label: "System".to_string(),
+            kind: EnvironmentKind::System,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelExecution {
@@ -73,6 +105,54 @@ impl SessionManager {
         self.register_kernel(Box::new(BashKernelAdapter::default()))?;
         self.register_kernel(Box::new(PythonKernelAdapter::default()))?;
         self.register_kernel(Box::new(JavaScriptKernelAdapter::default()))?;
+        Ok(())
+    }
+
+    pub fn configure_for_notebook(
+        &mut self,
+        notebook: &Notebook,
+        notebook_path: Option<&Path>,
+    ) -> Result<()> {
+        self.shutdown()?;
+        self.kernels.clear();
+        self.language_map.clear();
+
+        if is_legacy_multikernel_notebook(notebook) {
+            self.register_default_kernels()?;
+            self.hydrate()?;
+            return Ok(());
+        }
+
+        match notebook.metadata.runtime.kernel {
+            KernelKind::Python => {
+                let environments = discover_environments(notebook_path, KernelKind::Python);
+                let selected = environments
+                    .iter()
+                    .find(|environment| environment.id == notebook.metadata.runtime.environment)
+                    .cloned()
+                    .unwrap_or_else(EnvironmentOption::system);
+                match selected.kind {
+                    EnvironmentKind::None => {}
+                    EnvironmentKind::System => {
+                        self.register_kernel(Box::new(PythonKernelAdapter::default()))?;
+                    }
+                    EnvironmentKind::PythonInterpreter(path) => {
+                        self.register_kernel(Box::new(PythonKernelAdapter::from_interpreter(path)))?;
+                    }
+                }
+            }
+            KernelKind::Bash => {
+                if notebook.metadata.runtime.environment != "none" {
+                    self.register_kernel(Box::new(BashKernelAdapter::default()))?;
+                }
+            }
+            KernelKind::JavaScript => {
+                if notebook.metadata.runtime.environment != "none" {
+                    self.register_kernel(Box::new(JavaScriptKernelAdapter::default()))?;
+                }
+            }
+        }
+        self.hydrate()?;
         Ok(())
     }
 
@@ -469,13 +549,23 @@ pub struct PythonKernelAdapter {
 
 impl Default for PythonKernelAdapter {
     fn default() -> Self {
+        Self::from_program("python3")
+    }
+}
+
+impl PythonKernelAdapter {
+    fn from_program(program: impl Into<String>) -> Self {
         Self {
             inner: WorkerKernelAdapter::new(
                 vec![Language::Python],
-                "python3",
+                program.into(),
                 vec![kernel_script("scripts/python_kernel.py")],
             ),
         }
+    }
+
+    pub fn from_interpreter(path: PathBuf) -> Self {
+        Self::from_program(path.display().to_string())
     }
 }
 
@@ -605,6 +695,61 @@ fn kernel_script(relative: &str) -> String {
         .to_string()
 }
 
+fn is_legacy_multikernel_notebook(notebook: &Notebook) -> bool {
+    notebook.metadata.runtime == crate::core::NotebookRuntime::default()
+        && notebook
+            .cells
+            .iter()
+            .any(|cell| matches!(cell.kind, CellKind::Code) && cell.language != Language::Python)
+}
+
+pub fn discover_environments(
+    notebook_path: Option<&Path>,
+    kernel: KernelKind,
+) -> Vec<EnvironmentOption> {
+    let mut environments = vec![EnvironmentOption::none(), EnvironmentOption::system()];
+    if kernel != KernelKind::Python {
+        return environments;
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut push_python = |label: String, path: PathBuf| {
+        if !path.is_file() {
+            return;
+        }
+        let id = path.display().to_string();
+        if seen.insert(id.clone()) {
+            environments.push(EnvironmentOption {
+                id,
+                label,
+                kind: EnvironmentKind::PythonInterpreter(path),
+            });
+        }
+    };
+
+    if let Ok(path) = std::env::var("VIRTUAL_ENV") {
+        push_python(
+            "Active venv".to_string(),
+            PathBuf::from(path).join("bin").join("python"),
+        );
+    }
+    if let Ok(path) = std::env::var("CONDA_PREFIX") {
+        push_python(
+            "Active conda".to_string(),
+            PathBuf::from(path).join("bin").join("python"),
+        );
+    }
+    if let Some(parent) = notebook_path.and_then(Path::parent) {
+        for name in [".venv", "venv", "env"] {
+            push_python(
+                format!("{} ({name})", parent.file_name().and_then(|v| v.to_str()).unwrap_or("Project")),
+                parent.join(name).join("bin").join("python"),
+            );
+        }
+    }
+    environments
+}
+
 fn apply_bridges(named_values: &mut BTreeMap<String, String>, bridges: &[BridgeValue]) {
     for bridge in bridges {
         if let BridgeValue::NamedValue { name, value } = bridge {
@@ -622,8 +767,7 @@ pub fn load_session_for_notebook(path: &Path, notebook: &Notebook) -> Result<Ses
     };
     let mut session =
         SessionManager::from_manifest(manifest).with_ai_runtime(AiRuntime::from_env()?);
-    session.register_default_kernels()?;
-    session.hydrate()?;
+    session.configure_for_notebook(notebook, Some(path))?;
     Ok(session)
 }
 
@@ -662,6 +806,9 @@ pub fn summarize_records(records: &[ExecutionRecord]) -> String {
 
 fn build_cell_outputs(execution_count: u32, execution: &KernelExecution) -> Vec<CellOutput> {
     let mut outputs = Vec::new();
+    if let Some(image_output) = build_image_output(execution_count, execution) {
+        outputs.push(image_output);
+    }
     if !execution.output.is_empty() {
         outputs.push(CellOutput::Stream {
             name: "stdout".to_string(),
@@ -688,6 +835,58 @@ fn build_cell_outputs(execution_count: u32, execution: &KernelExecution) -> Vec<
         });
     }
     outputs
+}
+
+fn build_image_output(_execution_count: u32, execution: &KernelExecution) -> Option<CellOutput> {
+    let output = execution.output.trim();
+    let image_path = if let Some(rest) = output.strip_prefix("display ") {
+        Some(rest.trim())
+    } else if looks_like_image_path(output) {
+        Some(output)
+    } else {
+        None
+    }?;
+
+    let path = PathBuf::from(image_path);
+    if !path.exists() {
+        return None;
+    }
+    let mime = match path.extension().and_then(|value| value.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        Some("gif") => "image/gif",
+        _ => return None,
+    };
+
+    let mut data = BTreeMap::new();
+    data.insert(
+        "text/plain".to_string(),
+        serde_json::Value::String(
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+                .to_string(),
+        ),
+    );
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "strata_image_path".to_string(),
+        serde_json::Value::String(path.display().to_string()),
+    );
+    metadata.insert(
+        "strata_image_mime".to_string(),
+        serde_json::Value::String(mime.to_string()),
+    );
+    Some(CellOutput::DisplayData { data, metadata })
+}
+
+fn looks_like_image_path(output: &str) -> bool {
+    output.ends_with(".png")
+        || output.ends_with(".jpg")
+        || output.ends_with(".jpeg")
+        || output.ends_with(".svg")
+        || output.ends_with(".gif")
 }
 
 fn apply_record_to_notebook(notebook: &mut Notebook, index: usize, record: &ExecutionRecord) {
@@ -757,6 +956,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(record.output, "5");
+    }
+
+    #[test]
+    fn discover_environments_includes_none_and_system() {
+        let environments = discover_environments(None, KernelKind::Python);
+        assert_eq!(environments[0].id, "none");
+        assert_eq!(environments[1].id, "system");
+    }
+
+    #[test]
+    fn build_image_output_detects_display_command() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().with_extension("png");
+        std::fs::write(&path, b"png").unwrap();
+        let execution = KernelExecution {
+            output: format!("display {}", path.display()),
+            error_output: String::new(),
+            exit_code: 0,
+            bridges: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        let output = build_image_output(1, &execution);
+        assert!(output.unwrap().image_info().is_some());
     }
 
     #[test]

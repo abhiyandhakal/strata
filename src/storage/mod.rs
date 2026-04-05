@@ -3,12 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::{
-    Cell, CellId, CellKind, CellOutput, Kernelspec, Language, LanguageInfo, Notebook,
-    NotebookMetadata, SessionManifest,
+    Cell, CellId, CellKind, CellOutput, KernelKind, Kernelspec, Language, LanguageInfo,
+    Notebook, NotebookMetadata, SessionManifest,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +113,14 @@ impl NotebookStorage {
                 metadata.title = title;
             }
             metadata.description = strata.description;
+            if let Some(kernel) = strata.kernel {
+                metadata.runtime.kernel = kernel;
+                metadata.kernelspec = kernel.kernelspec();
+                metadata.language_info = kernel.language_info();
+            }
+            if let Some(environment) = strata.environment {
+                metadata.runtime.environment = environment;
+            }
         }
 
         let cells = parsed
@@ -188,6 +197,8 @@ impl NotebookStorage {
         let strata = json!({
             "title": notebook.metadata.title,
             "description": notebook.metadata.description,
+            "kernel": notebook.metadata.runtime.kernel,
+            "environment": notebook.metadata.runtime.environment,
         });
         let mut metadata_extra = notebook.metadata.extra.clone();
         metadata_extra.insert("strata".to_string(), strata);
@@ -246,7 +257,9 @@ impl NotebookStorage {
     }
 
     pub fn save_smd(path: &Path, notebook: &Notebook) -> Result<()> {
-        let rendered = Self::render_smd(notebook);
+        let mut notebook = notebook.clone();
+        materialize_image_outputs(path, &mut notebook)?;
+        let rendered = Self::render_smd(&notebook);
         fs::write(path, rendered)
             .with_context(|| format!("failed to write notebook at {}", path.display()))
     }
@@ -354,7 +367,7 @@ impl NotebookStorage {
         let mut output = String::new();
         output.push_str("<!-- strata:format version=1 -->\n");
         output.push_str(&format!(
-            "<!-- strata:notebook title={:?}{} -->\n\n",
+            "<!-- strata:notebook title={:?}{} kernel={:?} environment={:?} -->\n\n",
             notebook.metadata.title,
             notebook
                 .metadata
@@ -362,6 +375,9 @@ impl NotebookStorage {
                 .as_ref()
                 .map(|value| format!(" description={value:?}"))
                 .unwrap_or_default()
+            ,
+            render_kernel(notebook.metadata.runtime.kernel),
+            notebook.metadata.runtime.environment
         ));
 
         for (index, cell) in notebook.cells.iter().enumerate() {
@@ -446,6 +462,13 @@ fn parse_notebook_comment(line: &str, metadata: &mut NotebookMetadata) -> Result
             match key {
                 "title" => metadata.title = value.to_string(),
                 "description" => metadata.description = Some(value.to_string()),
+                "kernel" => {
+                    let kernel = parse_kernel(value)?;
+                    metadata.runtime.kernel = kernel;
+                    metadata.kernelspec = kernel.kernelspec();
+                    metadata.language_info = kernel.language_info();
+                }
+                "environment" => metadata.runtime.environment = value.to_string(),
                 _ => {}
             }
         }
@@ -504,6 +527,8 @@ struct OutputMeta {
     execution_count: Option<u32>,
     ename: Option<String>,
     evalue: Option<String>,
+    mime: Option<String>,
+    path: Option<String>,
 }
 
 fn parse_output_comment(line: &str) -> Result<OutputMeta> {
@@ -523,6 +548,8 @@ fn parse_output_comment(line: &str) -> Result<OutputMeta> {
         execution_count: None,
         ename: None,
         evalue: None,
+        mime: None,
+        path: None,
     };
     for token in split_metadata_tokens(payload) {
         if let Some((key, value)) = token.split_once('=') {
@@ -533,6 +560,8 @@ fn parse_output_comment(line: &str) -> Result<OutputMeta> {
                 "execution_count" => meta.execution_count = Some(value.parse()?),
                 "ename" => meta.ename = Some(value),
                 "evalue" => meta.evalue = Some(value),
+                "mime" => meta.mime = Some(value),
+                "path" => meta.path = Some(value),
                 _ => {}
             }
         }
@@ -545,11 +574,11 @@ fn output_from_meta(meta: OutputMeta, text: String) -> CellOutput {
         "execute_result" => CellOutput::ExecuteResult {
             execution_count: meta.execution_count.unwrap_or(0),
             data: BTreeMap::from([("text/plain".to_string(), Value::String(text))]),
-            metadata: BTreeMap::new(),
+            metadata: image_output_metadata(&meta),
         },
         "display_data" => CellOutput::DisplayData {
             data: BTreeMap::from([("text/plain".to_string(), Value::String(text))]),
-            metadata: BTreeMap::new(),
+            metadata: image_output_metadata(&meta),
         },
         "error" => CellOutput::Error {
             ename: meta.ename.unwrap_or_else(|| "Error".to_string()),
@@ -568,15 +597,52 @@ fn render_output_comment(output: &CellOutput) -> String {
         CellOutput::Stream { name, .. } => {
             format!("<!-- strata:output kind=stream name={name:?} -->")
         }
-        CellOutput::ExecuteResult { execution_count, .. } => format!(
-            "<!-- strata:output kind=execute_result execution_count={} -->",
-            execution_count
+        CellOutput::ExecuteResult {
+            execution_count,
+            metadata,
+            ..
+        } => format!(
+            "<!-- strata:output kind=execute_result execution_count={}{}{} -->",
+            execution_count,
+            metadata
+                .get("strata_image_mime")
+                .and_then(Value::as_str)
+                .map(|mime| format!(" mime={mime:?}"))
+                .unwrap_or_default(),
+            metadata
+                .get("strata_image_path")
+                .and_then(Value::as_str)
+                .map(|path| format!(" path={path:?}"))
+                .unwrap_or_default()
         ),
-        CellOutput::DisplayData { .. } => "<!-- strata:output kind=display_data -->".to_string(),
+        CellOutput::DisplayData { metadata, .. } => format!(
+            "<!-- strata:output kind=display_data{}{} -->",
+            metadata
+                .get("strata_image_mime")
+                .and_then(Value::as_str)
+                .map(|mime| format!(" mime={mime:?}"))
+                .unwrap_or_default(),
+            metadata
+                .get("strata_image_path")
+                .and_then(Value::as_str)
+                .map(|path| format!(" path={path:?}"))
+                .unwrap_or_default()
+        ),
         CellOutput::Error { ename, evalue, .. } => format!(
             "<!-- strata:output kind=error ename={ename:?} evalue={evalue:?} -->"
         ),
     }
+}
+
+fn image_output_metadata(meta: &OutputMeta) -> BTreeMap<String, Value> {
+    let mut metadata = BTreeMap::new();
+    if let Some(mime) = &meta.mime {
+        metadata.insert("strata_image_mime".to_string(), Value::String(mime.clone()));
+    }
+    if let Some(path) = &meta.path {
+        metadata.insert("strata_image_path".to_string(), Value::String(path.clone()));
+    }
+    metadata
 }
 
 fn parse_language(language: &str) -> Language {
@@ -596,6 +662,23 @@ fn render_kind(kind: CellKind) -> &'static str {
         CellKind::Markdown => "markdown",
         CellKind::Raw => "raw",
         CellKind::Ai => "ai",
+    }
+}
+
+fn parse_kernel(value: &str) -> Result<KernelKind> {
+    Ok(match value {
+        "python" => KernelKind::Python,
+        "bash" => KernelKind::Bash,
+        "javascript" | "js" => KernelKind::JavaScript,
+        other => bail!("unknown kernel {other}"),
+    })
+}
+
+fn render_kernel(kernel: KernelKind) -> &'static str {
+    match kernel {
+        KernelKind::Python => "python",
+        KernelKind::Bash => "bash",
+        KernelKind::JavaScript => "javascript",
     }
 }
 
@@ -666,6 +749,70 @@ fn split_attachments(
     (metadata, attachments)
 }
 
+fn materialize_image_outputs(path: &Path, notebook: &mut Notebook) -> Result<()> {
+    let artifacts_dir = CheckpointPaths::for_notebook(path).artifacts;
+    fs::create_dir_all(&artifacts_dir)?;
+    let notebook_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    for cell in &mut notebook.cells {
+        for (index, output) in cell.outputs.iter_mut().enumerate() {
+            let Some(image) = output.image_info() else {
+                continue;
+            };
+            if image.path.is_some() {
+                continue;
+            }
+            let extension = match image.mime.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/svg+xml" => "svg",
+                "image/gif" => "gif",
+                _ => continue,
+            };
+            let artifact_path = artifacts_dir.join(format!("{}-{index}.{extension}", cell.id.0));
+            let Some(data) = image.data else {
+                continue;
+            };
+            match image.mime.as_str() {
+                "image/svg+xml" => {
+                    fs::write(
+                        &artifact_path,
+                        data.as_str().unwrap_or_default().as_bytes(),
+                    )?;
+                }
+                _ => {
+                    let encoded = data.as_str().unwrap_or_default();
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .context("failed to decode image payload")?;
+                    fs::write(&artifact_path, decoded)?;
+                }
+            }
+
+            let relative = artifact_path
+                .strip_prefix(notebook_dir)
+                .unwrap_or(&artifact_path)
+                .display()
+                .to_string();
+            match output {
+                CellOutput::ExecuteResult { metadata, .. }
+                | CellOutput::DisplayData { metadata, .. } => {
+                    metadata.insert(
+                        "strata_image_path".to_string(),
+                        Value::String(relative),
+                    );
+                    metadata.insert(
+                        "strata_image_mime".to_string(),
+                        Value::String(image.mime),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct IpynbNotebook {
     nbformat: u8,
@@ -692,6 +839,10 @@ struct StrataNotebookMetadata {
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel: Option<KernelKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -768,6 +919,8 @@ mod tests {
             Cell::raw("plain"),
         ]);
         let mut notebook = notebook;
+        notebook.metadata.runtime.kernel = KernelKind::Bash;
+        notebook.metadata.runtime.environment = "none".to_string();
         notebook.cells[1].execution_count = Some(2);
         notebook.cells[1].outputs = vec![CellOutput::Stream {
             name: "stdout".to_string(),
@@ -785,6 +938,8 @@ mod tests {
         assert_eq!(parsed.cells[1].execution_count, Some(2));
         assert_eq!(parsed.cells[1].primary_output_text(), "1\n");
         assert_eq!(parsed.cells[2].kind, CellKind::Raw);
+        assert_eq!(parsed.metadata.runtime.kernel, KernelKind::Bash);
+        assert_eq!(parsed.metadata.runtime.environment, "none");
     }
 
     #[test]
