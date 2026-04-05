@@ -41,6 +41,16 @@ enum AppMode {
     Edit,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ExCommandState {
+    buffer: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingModal {
+    QuitConfirm,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VimMode {
     Normal,
@@ -563,6 +573,9 @@ pub struct App {
     mouse_text_selection: Option<MouseTextSelection>,
     terminal_images: Option<TerminalImageSupport>,
     markdown_image_cache: BTreeMap<PathBuf, StatefulProtocol>,
+    ex_command: Option<ExCommandState>,
+    pending_modal: Option<PendingModal>,
+    last_saved_snapshot: String,
 }
 
 impl App {
@@ -645,9 +658,13 @@ impl App {
             mouse_text_selection: None,
             terminal_images: None,
             markdown_image_cache: BTreeMap::new(),
+            ex_command: None,
+            pending_modal: None,
+            last_saved_snapshot: String::new(),
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
+        app.last_saved_snapshot = app.notebook_snapshot();
         app.refresh_status();
         if let Some(notice) = startup_notice {
             app.status = notice;
@@ -693,6 +710,9 @@ impl App {
     }
 
     fn handle_command_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if let Some(PendingModal::QuitConfirm) = self.pending_modal {
+            return self.handle_quit_modal(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.copy_current_target()?;
             return Ok(false);
@@ -706,7 +726,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return self.request_quit(),
             KeyCode::Esc => self.clear_selection(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -737,6 +757,9 @@ impl App {
     }
 
     fn handle_edit_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.ex_command.is_some() {
+            return self.handle_ex_command(key);
+        }
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('z') {
             self.apply_editor_to_cell();
             self.mode = AppMode::Command;
@@ -768,10 +791,21 @@ impl App {
         }
 
         if self.vim_enabled {
+            if matches!(self.vim_mode(), Some(VimMode::Normal))
+                && key.code == KeyCode::Char(':')
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                self.ex_command = Some(ExCommandState::default());
+                self.refresh_status();
+                return Ok(false);
+            }
             if key.code == KeyCode::Esc && matches!(self.vim_mode(), Some(VimMode::Normal)) {
                 self.apply_editor_to_cell();
                 self.mode = AppMode::Command;
                 self.vim = None;
+                self.ex_command = None;
                 self.sync_editor_presentation();
                 self.refresh_status();
                 return Ok(false);
@@ -970,6 +1004,9 @@ impl App {
                     .title(Line::styled("Status", self.theme.style("status.title"))),
             );
         frame.render_widget(status, chunks[2]);
+        if self.pending_modal.is_some() {
+            self.draw_quit_modal(frame, frame.area());
+        }
     }
 
     fn draw_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -978,8 +1015,12 @@ impl App {
         let environment_label = self.current_environment_label();
         let title = Line::from(vec![
             Span::raw(format!(
-                "{} | kernel={} | env={} | mode={:?} | ",
-                display_title, kernel_label, environment_label, self.mode
+                "{}{} | kernel={} | env={} | mode={:?} | ",
+                display_title,
+                if self.is_dirty() { " *" } else { "" },
+                kernel_label,
+                environment_label,
+                self.mode
             )),
             Span::styled(self.python_lsp.summary(), self.python_lsp_style()),
             Span::raw(format!(" | theme={}", self.theme.name())),
@@ -1046,6 +1087,34 @@ impl App {
             });
             x += label.len() as u16 + 1;
         }
+    }
+
+    fn draw_quit_modal(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let width = 44.min(area.width.saturating_sub(4)).max(20);
+        let height = 5.min(area.height.saturating_sub(2)).max(3);
+        let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+        let y = area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2);
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let body = Paragraph::new(Text::from(vec![
+            Line::from("Unsaved changes detected."),
+            Line::from("[s] Save   [d] Discard   [Esc] Cancel"),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Quit")
+                .style(self.theme.style("toolbar.block"))
+                .border_style(self.theme.style("toolbar.border")),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(body, modal_area);
     }
 
     fn draw_notebook(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1135,23 +1204,21 @@ impl App {
         };
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
         let body_text = match cell.kind {
-            CellKind::Markdown if rendered => {
-                Text::from(
-                    render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme)
-                        .blocks
-                        .into_iter()
-                        .flat_map(|block| match block {
-                            MarkdownBlock::Text { line, .. } => vec![line],
-                            MarkdownBlock::Image { alt, .. } => {
-                                vec![Line::from(vec![Span::styled(
-                                    alt,
-                                    self.theme.style("markdown.image.link"),
-                                )])]
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            }
+            CellKind::Markdown if rendered => Text::from(
+                render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme)
+                    .blocks
+                    .into_iter()
+                    .flat_map(|block| match block {
+                        MarkdownBlock::Text { line, .. } => vec![line],
+                        MarkdownBlock::Image { alt, .. } => {
+                            vec![Line::from(vec![Span::styled(
+                                alt,
+                                self.theme.style("markdown.image.link"),
+                            )])]
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             CellKind::Code => render_code_block(cell, &self.theme),
             _ => Text::from(cell.source.clone()),
         };
@@ -1583,6 +1650,7 @@ impl App {
                 .with_context(|| format!("failed to save {}", path.display()))?;
         }
         self.save_checkpoint_only()?;
+        self.last_saved_snapshot = self.notebook_snapshot();
         self.status = "saved notebook and checkpoint".to_string();
         Ok(())
     }
@@ -1599,6 +1667,14 @@ impl App {
         self.session.manifest.ui_state.selected_cell = self.selected;
         self.session.manifest.ui_state.viewport_row = self.scroll_offset as usize;
         self.session.manifest.ui_state.cell_modes = self.cell_modes.clone();
+    }
+
+    fn notebook_snapshot(&self) -> String {
+        serde_json::to_string(&self.notebook).unwrap_or_default()
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.notebook_snapshot() != self.last_saved_snapshot
     }
 
     fn run_selected_cell(&mut self) -> Result<()> {
@@ -1693,6 +1769,7 @@ impl App {
             NotebookStorage::save(&path, &self.notebook)
                 .with_context(|| format!("failed to save {}", path.display()))?;
             self.save_checkpoint_only()?;
+            self.last_saved_snapshot = self.notebook_snapshot();
         }
         Ok(())
     }
@@ -1807,10 +1884,14 @@ impl App {
     }
 
     fn refresh_status(&mut self) {
+        if let Some(ex) = &self.ex_command {
+            self.status = format!(":{}", ex.buffer);
+            return;
+        }
         self.status = match (self.mode, self.vim_mode()) {
             (AppMode::Command, _) => "command: click cells/buttons | y copy | Y copy block | gy copy output | z fold | o output | e edit | r run | R run all | c code | m markdown | d delete | ctrl-s save | q quit".to_string(),
             (AppMode::Edit, Some(VimMode::Normal)) => {
-                "edit vim NORMAL: i insert | y copy in VISUAL | Esc exit editor | alt-z fold | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
+                "edit vim NORMAL: i insert | :w save | y copy in VISUAL | Esc exit editor | alt-z fold | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
             (AppMode::Edit, Some(VimMode::Insert)) => {
                 "edit vim INSERT: Esc normal | alt-z fold | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
@@ -1939,6 +2020,71 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn request_quit(&mut self) -> Result<bool> {
+        if self.is_dirty() {
+            self.pending_modal = Some(PendingModal::QuitConfirm);
+            self.status = "unsaved changes".to_string();
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn handle_quit_modal(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('y') => {
+                self.save_all()?;
+                self.pending_modal = None;
+                Ok(true)
+            }
+            KeyCode::Char('d') | KeyCode::Char('n') => {
+                self.pending_modal = None;
+                Ok(true)
+            }
+            KeyCode::Esc | KeyCode::Char('c') => {
+                self.pending_modal = None;
+                self.refresh_status();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn handle_ex_command(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(ex) = self.ex_command.as_mut() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.ex_command = None;
+                self.refresh_status();
+            }
+            KeyCode::Backspace => {
+                ex.buffer.pop();
+                self.refresh_status();
+            }
+            KeyCode::Enter => {
+                let command = ex.buffer.trim().to_string();
+                self.ex_command = None;
+                match command.as_str() {
+                    "w" => self.save_all()?,
+                    "" => self.refresh_status(),
+                    other => self.status = format!("unknown ex command: {other}"),
+                }
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                ex.buffer.push(ch);
+                self.refresh_status();
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn place_editor_cursor(&mut self, column: u16, row: u16, rect: Rect, selecting: bool) {
@@ -3869,9 +4015,55 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("def"));
-        assert!(buffer
-            .content()
-            .iter()
-            .any(|cell| cell.symbol() == "d" && cell.fg != ratatui::style::Color::Reset));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "d" && cell.fg != ratatui::style::Color::Reset)
+        );
+    }
+
+    #[test]
+    fn vim_ex_w_saves_notebook() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("vim-save.smd");
+        let notebook = Notebook::new("Save").with_cells(vec![Cell::markdown("hello")]);
+        NotebookStorage::save(&path, &notebook).unwrap();
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(
+            notebook,
+            Some(path.clone()),
+            session,
+            true,
+            Theme::default_theme(),
+            None,
+        );
+
+        app.enter_edit_mode();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.ex_command.is_none());
+        assert!(!app.is_dirty());
+        assert!(std::fs::read_to_string(path).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn quit_with_unsaved_changes_opens_modal() {
+        let notebook = Notebook::new("Quit").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        app.notebook.cells[0].source = "changed".to_string();
+
+        let should_quit = app
+            .handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.pending_modal, Some(PendingModal::QuitConfirm));
     }
 }
