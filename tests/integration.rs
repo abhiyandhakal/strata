@@ -21,8 +21,8 @@ fn notebook_markdown_round_trip_keeps_shapes() {
         Cell::ai("summarize the shell output"),
     ]);
 
-    let rendered = NotebookStorage::render_markdown(&notebook);
-    let parsed = NotebookStorage::parse_markdown(&rendered).unwrap();
+    let rendered = NotebookStorage::render_smd(&notebook);
+    let parsed = NotebookStorage::parse_smd(&rendered).unwrap();
 
     assert_eq!(parsed.cells.len(), 4);
     assert_eq!(parsed.cells[1].language, Language::Bash);
@@ -38,7 +38,7 @@ fn checkpoint_storage_round_trip_works() {
         .named_values
         .insert("shared".to_string(), "value".to_string());
     let temp = TempDir::new().unwrap();
-    let notebook_path = temp.path().join("demo.strata.md");
+    let notebook_path = temp.path().join("demo.smd");
     fs::write(&notebook_path, "# Demo").unwrap();
 
     let paths = CheckpointPaths::for_notebook(&notebook_path);
@@ -272,12 +272,13 @@ fn ai_runtime_uses_anthropic_provider() {
 }
 
 #[test]
-fn cli_run_executes_notebook_and_persists_checkpoint() {
+fn cli_run_executes_smd_notebook_and_persists_checkpoint() {
     let temp = TempDir::new().unwrap();
-    let notebook_path = temp.path().join("flow.md");
+    let notebook_path = temp.path().join("flow.smd");
     fs::write(
         &notebook_path,
-        r#"# Flow
+        r#"<!-- strata:format version=1 -->
+<!-- strata:notebook title="Flow" -->
 
 <!-- strata:cell id=cell-0001 kind=code language=python -->
 ```python
@@ -317,10 +318,11 @@ console.log(strata.input("shared"))
 #[test]
 fn cli_run_handles_javascript_and_typescript_cells() {
     let temp = TempDir::new().unwrap();
-    let notebook_path = temp.path().join("js-ts.md");
+    let notebook_path = temp.path().join("js-ts.smd");
     fs::write(
         &notebook_path,
-        r#"# JS TS
+        r#"<!-- strata:format version=1 -->
+<!-- strata:notebook title="JS TS" -->
 
 <!-- strata:cell id=cell-0001 kind=code language=javascript -->
 ```javascript
@@ -345,12 +347,12 @@ console.log(globalThis.count);
 }
 
 #[test]
-fn cli_run_updates_ipynb_outputs_and_execution_counts() {
+fn cli_run_updates_smd_outputs_and_execution_counts() {
     let temp = TempDir::new().unwrap();
-    let notebook_path = temp.path().join("flow.ipynb");
+    let notebook_path = temp.path().join("flow.smd");
     let notebook = Notebook::new("Flow").with_cells(vec![
         Cell::markdown("# Flow"),
-        Cell::code(Language::Python, "print('hello from ipynb')"),
+        Cell::code(Language::Python, "print('hello from smd')"),
     ]);
     NotebookStorage::save(&notebook_path, &notebook).unwrap();
 
@@ -359,7 +361,7 @@ fn cli_run_updates_ipynb_outputs_and_execution_counts() {
         .arg(&notebook_path)
         .assert()
         .success()
-        .stdout(contains("hello from ipynb"));
+        .stdout(contains("hello from smd"));
 
     let persisted = NotebookStorage::load(&notebook_path).unwrap();
     assert_eq!(persisted.cells[1].execution_count, Some(1));
@@ -372,10 +374,11 @@ fn cli_run_updates_ipynb_outputs_and_execution_counts() {
 #[test]
 fn cli_run_records_ai_failures_without_aborting() {
     let temp = TempDir::new().unwrap();
-    let notebook_path = temp.path().join("ai.md");
+    let notebook_path = temp.path().join("ai.smd");
     fs::write(
         &notebook_path,
-        r#"# AI
+        r#"<!-- strata:format version=1 -->
+<!-- strata:notebook title="AI" -->
 
 <!-- strata:cell id=cell-0001 kind=ai language=ai -->
 ```ai
@@ -402,4 +405,54 @@ Explain this notebook
         manifest.execution_history[0].status,
         ExecutionStatus::Failed
     );
+}
+
+#[test]
+fn cli_imports_ipynb_to_smd() {
+    let temp = TempDir::new().unwrap();
+    let input = temp.path().join("demo.ipynb");
+    let output = temp.path().join("demo.smd");
+    let notebook = Notebook::new("Convert").with_cells(vec![
+        Cell::markdown("intro"),
+        Cell::code(Language::Python, "print('ok')"),
+    ]);
+    NotebookStorage::save_ipynb(&input, &notebook).unwrap();
+
+    Command::cargo_bin("strata")
+        .unwrap()
+        .arg("import")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(contains("Imported"));
+
+    let converted = NotebookStorage::load_smd(&output).unwrap();
+    assert_eq!(converted.metadata.title, "Convert");
+    assert_eq!(converted.cells.len(), 2);
+}
+
+#[test]
+fn cli_exports_smd_to_ipynb() {
+    let temp = TempDir::new().unwrap();
+    let input = temp.path().join("demo.smd");
+    let output = temp.path().join("demo.ipynb");
+    let notebook = Notebook::new("Convert").with_cells(vec![Cell::code(
+        Language::Python,
+        "print('ok')",
+    )]);
+    NotebookStorage::save_smd(&input, &notebook).unwrap();
+
+    Command::cargo_bin("strata")
+        .unwrap()
+        .arg("export")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(contains("Exported"));
+
+    let converted = NotebookStorage::load_ipynb(&output).unwrap();
+    assert_eq!(converted.metadata.title, "Convert");
+    assert_eq!(converted.cells.len(), 1);
 }

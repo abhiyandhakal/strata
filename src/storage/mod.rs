@@ -11,6 +11,21 @@ use crate::core::{
     NotebookMetadata, SessionManifest,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotebookFormat {
+    Smd,
+    Ipynb,
+}
+
+impl NotebookFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            NotebookFormat::Smd => "smd",
+            NotebookFormat::Ipynb => "ipynb",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CheckpointPaths {
     pub root: PathBuf,
@@ -40,24 +55,31 @@ impl CheckpointPaths {
 pub struct NotebookStorage;
 
 impl NotebookStorage {
-    pub fn load(path: &Path) -> Result<Notebook> {
+    pub fn format_for_path(path: &Path) -> NotebookFormat {
         match path.extension().and_then(|value| value.to_str()) {
-            Some("ipynb") => Self::load_ipynb(path),
-            _ => Self::load_markdown(path),
+            Some("ipynb") => NotebookFormat::Ipynb,
+            _ => NotebookFormat::Smd,
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Notebook> {
+        match Self::format_for_path(path) {
+            NotebookFormat::Ipynb => Self::load_ipynb(path),
+            NotebookFormat::Smd => Self::load_smd(path),
         }
     }
 
     pub fn save(path: &Path, notebook: &Notebook) -> Result<()> {
-        match path.extension().and_then(|value| value.to_str()) {
-            Some("ipynb") => Self::save_ipynb(path, notebook),
-            _ => Self::save_markdown(path, notebook),
+        match Self::format_for_path(path) {
+            NotebookFormat::Ipynb => Self::save_ipynb(path, notebook),
+            NotebookFormat::Smd => Self::save_smd(path, notebook),
         }
     }
 
     pub fn render(path: Option<&Path>, notebook: &Notebook) -> String {
-        match path.and_then(|value| value.extension().and_then(|ext| ext.to_str())) {
-            Some("ipynb") => Self::render_ipynb(notebook),
-            _ => Self::render_markdown(notebook),
+        match path.map(Self::format_for_path).unwrap_or(NotebookFormat::Smd) {
+            NotebookFormat::Ipynb => Self::render_ipynb(notebook),
+            NotebookFormat::Smd => Self::render_smd(notebook),
         }
     }
 
@@ -217,50 +239,51 @@ impl NotebookStorage {
         serde_json::to_string_pretty(&rendered).expect("ipynb render should succeed")
     }
 
-    pub fn load_markdown(path: &Path) -> Result<Notebook> {
+    pub fn load_smd(path: &Path) -> Result<Notebook> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read notebook at {}", path.display()))?;
-        Self::parse_markdown(&raw)
+        Self::parse_smd(&raw)
     }
 
-    pub fn save_markdown(path: &Path, notebook: &Notebook) -> Result<()> {
-        let rendered = Self::render_markdown(notebook);
+    pub fn save_smd(path: &Path, notebook: &Notebook) -> Result<()> {
+        let rendered = Self::render_smd(notebook);
         fs::write(path, rendered)
             .with_context(|| format!("failed to write notebook at {}", path.display()))
     }
 
-    pub fn parse_markdown(raw: &str) -> Result<Notebook> {
+    pub fn parse_smd(raw: &str) -> Result<Notebook> {
         let mut metadata = NotebookMetadata::default();
         let mut cells = Vec::new();
-        let mut pending_meta: Option<(CellId, CellKind, Language)> = None;
-        let mut text_buffer: Vec<String> = Vec::new();
         let lines: Vec<&str> = raw.lines().collect();
         let mut index = 0usize;
 
         while index < lines.len() {
             let line = lines[index];
-            if index == 0 && line.starts_with("# ") {
-                metadata.title = line.trim_start_matches("# ").trim().to_string();
+            let trimmed = line.trim();
+
+            if trimmed.starts_with("<!-- strata:format") {
                 index += 1;
                 continue;
             }
 
-            if line.trim_start().starts_with("<!-- strata:cell") {
-                if !text_buffer.is_empty() {
-                    let source = join_and_trim(&text_buffer);
-                    if !source.is_empty() {
-                        cells.push(Cell::markdown(source));
-                    }
-                    text_buffer.clear();
+            if trimmed.starts_with("<!-- strata:notebook") {
+                parse_notebook_comment(trimmed, &mut metadata)?;
+                index += 1;
+                continue;
+            }
+
+            if trimmed.starts_with("<!-- strata:cell") {
+                let (id, kind, language, execution_count) = parse_cell_comment(trimmed)?;
+                index += 1;
+
+                while index < lines.len() && lines[index].trim().is_empty() {
+                    index += 1;
                 }
-                pending_meta = Some(parse_cell_comment(line)?);
-                index += 1;
-                continue;
-            }
 
-            if line.trim_start().starts_with("```") {
-                let fence = line.trim().trim_start_matches("```").trim();
-                let language = parse_language(fence);
+                if index >= lines.len() || !lines[index].trim_start().starts_with("```") {
+                    bail!("cell missing fenced content block");
+                }
+                let fence = lines[index].trim().trim_start_matches("```").trim();
                 let mut body = Vec::new();
                 index += 1;
                 while index < lines.len() && !lines[index].trim_start().starts_with("```") {
@@ -270,69 +293,104 @@ impl NotebookStorage {
                 if index == lines.len() {
                     bail!("unclosed fenced block in notebook");
                 }
-                let source = body.join("\n");
-                let cell = match pending_meta.take() {
-                    Some((id, kind, meta_language)) => Cell {
-                        id,
-                        kind,
-                        language: meta_language,
-                        source,
-                        execution_count: None,
-                        outputs: Vec::new(),
-                        metadata: BTreeMap::new(),
+                let mut cell = Cell {
+                    id,
+                    kind,
+                    language: if kind == CellKind::Code {
+                        parse_language(fence)
+                    } else {
+                        language
                     },
-                    None => Cell::code(language, source),
+                    source: body.join("\n"),
+                    execution_count,
+                    outputs: Vec::new(),
+                    metadata: BTreeMap::new(),
                 };
-                cells.push(cell);
                 index += 1;
+
+                loop {
+                    while index < lines.len() && lines[index].trim().is_empty() {
+                        index += 1;
+                    }
+                    if index >= lines.len() || !lines[index].trim_start().starts_with("<!-- strata:output") {
+                        break;
+                    }
+                    let output_meta = parse_output_comment(lines[index].trim())?;
+                    index += 1;
+                    while index < lines.len() && lines[index].trim().is_empty() {
+                        index += 1;
+                    }
+                    if index >= lines.len() || !lines[index].trim_start().starts_with("```") {
+                        bail!("output missing fenced content block");
+                    }
+                    let mut output_body = Vec::new();
+                    index += 1;
+                    while index < lines.len() && !lines[index].trim_start().starts_with("```") {
+                        output_body.push(lines[index].to_string());
+                        index += 1;
+                    }
+                    if index == lines.len() {
+                        bail!("unclosed output fenced block in notebook");
+                    }
+                    index += 1;
+                    cell.outputs
+                        .push(output_from_meta(output_meta, output_body.join("\n")));
+                }
+                cells.push(cell);
                 continue;
             }
-
-            text_buffer.push(line.to_string());
             index += 1;
         }
 
-        if !text_buffer.is_empty() {
-            let source = join_and_trim(&text_buffer);
-            if !source.is_empty() {
-                cells.push(Cell::markdown(source));
-            }
-        }
-
-        Ok(Notebook::new(metadata.title).with_cells(cells))
+        Ok(Notebook {
+            metadata,
+            nbformat: 4,
+            nbformat_minor: 5,
+            cells,
+        })
     }
 
-    pub fn render_markdown(notebook: &Notebook) -> String {
+    pub fn render_smd(notebook: &Notebook) -> String {
         let mut output = String::new();
-        output.push_str("# ");
-        output.push_str(&notebook.metadata.title);
-        output.push_str("\n\n");
+        output.push_str("<!-- strata:format version=1 -->\n");
+        output.push_str(&format!(
+            "<!-- strata:notebook title={:?}{} -->\n\n",
+            notebook.metadata.title,
+            notebook
+                .metadata
+                .description
+                .as_ref()
+                .map(|value| format!(" description={value:?}"))
+                .unwrap_or_default()
+        ));
 
         for (index, cell) in notebook.cells.iter().enumerate() {
-            match cell.kind {
-                CellKind::Markdown => {
-                    output.push_str(cell.source.trim());
-                    output.push('\n');
-                }
-                CellKind::Raw => {
-                    output.push_str(&format!("<!-- strata:cell id={} kind=raw language=text -->\n", cell.id.0));
-                    output.push_str("```text\n");
-                    output.push_str(cell.source.trim_end());
-                    output.push_str("\n```\n");
-                }
-                CellKind::Code | CellKind::Ai => {
-                    output.push_str(&format!(
-                        "<!-- strata:cell id={} kind={} language={} -->\n",
-                        cell.id.0,
-                        render_kind(cell.kind),
-                        cell.language.fence_name()
-                    ));
-                    output.push_str("```");
-                    output.push_str(cell.language.fence_name());
-                    output.push('\n');
-                    output.push_str(cell.source.trim_end());
-                    output.push_str("\n```\n");
-                }
+            output.push_str(&format!(
+                "<!-- strata:cell id={} kind={} language={}{} -->\n",
+                cell.id.0,
+                render_kind(cell.kind),
+                cell.language.fence_name(),
+                cell.execution_count
+                    .map(|value| format!(" execution_count={value}"))
+                    .unwrap_or_default()
+            ));
+            output.push_str("```");
+            output.push_str(match cell.kind {
+                CellKind::Markdown => "markdown",
+                CellKind::Raw => "raw",
+                _ => cell.language.fence_name(),
+            });
+            output.push('\n');
+            output.push_str(cell.source.trim_end());
+            output.push_str("\n```\n");
+
+            for output_block in &cell.outputs {
+                output.push('\n');
+                output.push_str(&render_output_comment(output_block));
+                output.push('\n');
+                output.push_str("```text\n");
+                output.push_str(&output_block.as_text());
+                output.push_str("\n```\n");
             }
 
             if index + 1 < notebook.cells.len() {
@@ -371,7 +429,32 @@ impl CheckpointStorage {
     }
 }
 
-fn parse_cell_comment(line: &str) -> Result<(CellId, CellKind, Language)> {
+fn parse_notebook_comment(line: &str, metadata: &mut NotebookMetadata) -> Result<()> {
+    let inner = line
+        .trim()
+        .trim_start_matches("<!--")
+        .trim_end_matches("-->")
+        .trim();
+    let payload = inner
+        .strip_prefix("strata:notebook")
+        .map(str::trim)
+        .context("invalid notebook metadata comment")?;
+
+    for token in split_metadata_tokens(payload) {
+        if let Some((key, value)) = token.split_once('=') {
+            let value = unquote(value);
+            match key {
+                "title" => metadata.title = value.to_string(),
+                "description" => metadata.description = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_cell_comment(line: &str) -> Result<(CellId, CellKind, Language, Option<u32>)> {
     let inner = line
         .trim()
         .trim_start_matches("<!--")
@@ -385,10 +468,11 @@ fn parse_cell_comment(line: &str) -> Result<(CellId, CellKind, Language)> {
     let mut id = None;
     let mut kind = None;
     let mut language = None;
-    for token in payload.split_whitespace() {
+    let mut execution_count = None;
+    for token in split_metadata_tokens(payload) {
         if let Some((key, value)) = token.split_once('=') {
             match key {
-                "id" => id = Some(CellId(value.to_string())),
+                "id" => id = Some(CellId(unquote(value).to_string())),
                 "kind" => {
                     kind = Some(match value {
                         "code" => CellKind::Code,
@@ -398,7 +482,8 @@ fn parse_cell_comment(line: &str) -> Result<(CellId, CellKind, Language)> {
                         _ => bail!("unknown cell kind {value}"),
                     })
                 }
-                "language" => language = Some(parse_language(value)),
+                "language" => language = Some(parse_language(unquote(value))),
+                "execution_count" => execution_count = Some(unquote(value).parse()?),
                 _ => {}
             }
         }
@@ -408,7 +493,90 @@ fn parse_cell_comment(line: &str) -> Result<(CellId, CellKind, Language)> {
         id.context("cell metadata missing id")?,
         kind.context("cell metadata missing kind")?,
         language.context("cell metadata missing language")?,
+        execution_count,
     ))
+}
+
+#[derive(Clone, Debug)]
+struct OutputMeta {
+    kind: String,
+    name: Option<String>,
+    execution_count: Option<u32>,
+    ename: Option<String>,
+    evalue: Option<String>,
+}
+
+fn parse_output_comment(line: &str) -> Result<OutputMeta> {
+    let inner = line
+        .trim()
+        .trim_start_matches("<!--")
+        .trim_end_matches("-->")
+        .trim();
+    let payload = inner
+        .strip_prefix("strata:output")
+        .map(str::trim)
+        .context("invalid output metadata comment")?;
+
+    let mut meta = OutputMeta {
+        kind: "stream".to_string(),
+        name: None,
+        execution_count: None,
+        ename: None,
+        evalue: None,
+    };
+    for token in split_metadata_tokens(payload) {
+        if let Some((key, value)) = token.split_once('=') {
+            let value = unquote(value).to_string();
+            match key {
+                "kind" => meta.kind = value,
+                "name" => meta.name = Some(value),
+                "execution_count" => meta.execution_count = Some(value.parse()?),
+                "ename" => meta.ename = Some(value),
+                "evalue" => meta.evalue = Some(value),
+                _ => {}
+            }
+        }
+    }
+    Ok(meta)
+}
+
+fn output_from_meta(meta: OutputMeta, text: String) -> CellOutput {
+    match meta.kind.as_str() {
+        "execute_result" => CellOutput::ExecuteResult {
+            execution_count: meta.execution_count.unwrap_or(0),
+            data: BTreeMap::from([("text/plain".to_string(), Value::String(text))]),
+            metadata: BTreeMap::new(),
+        },
+        "display_data" => CellOutput::DisplayData {
+            data: BTreeMap::from([("text/plain".to_string(), Value::String(text))]),
+            metadata: BTreeMap::new(),
+        },
+        "error" => CellOutput::Error {
+            ename: meta.ename.unwrap_or_else(|| "Error".to_string()),
+            evalue: meta.evalue.unwrap_or_default(),
+            traceback: text.lines().map(ToString::to_string).collect(),
+        },
+        _ => CellOutput::Stream {
+            name: meta.name.unwrap_or_else(|| "stdout".to_string()),
+            text,
+        },
+    }
+}
+
+fn render_output_comment(output: &CellOutput) -> String {
+    match output {
+        CellOutput::Stream { name, .. } => {
+            format!("<!-- strata:output kind=stream name={name:?} -->")
+        }
+        CellOutput::ExecuteResult { execution_count, .. } => format!(
+            "<!-- strata:output kind=execute_result execution_count={} -->",
+            execution_count
+        ),
+        CellOutput::DisplayData { .. } => "<!-- strata:output kind=display_data -->".to_string(),
+        CellOutput::Error { ename, evalue, .. } => format!(
+            "<!-- strata:output kind=error ename={ename:?} evalue={evalue:?} -->"
+        ),
+    }
 }
 
 fn parse_language(language: &str) -> Language {
@@ -431,8 +599,49 @@ fn render_kind(kind: CellKind) -> &'static str {
     }
 }
 
-fn join_and_trim(lines: &[String]) -> String {
-    lines.join("\n").trim().to_string()
+fn split_metadata_tokens(payload: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = '\0';
+
+    for ch in payload.chars() {
+        if in_quotes {
+            current.push(ch);
+            if ch == quote_char {
+                in_quotes = false;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            in_quotes = true;
+            quote_char = ch;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
 }
 
 fn split_lines(source: &str) -> Vec<String> {
@@ -552,21 +761,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn markdown_round_trip_preserves_code_metadata() {
+    fn smd_round_trip_preserves_code_metadata_and_outputs() {
         let notebook = Notebook::new("Demo").with_cells(vec![
             Cell::markdown("intro"),
             Cell::code(Language::Python, "value = 1\nprint(value)"),
             Cell::raw("plain"),
         ]);
+        let mut notebook = notebook;
+        notebook.cells[1].execution_count = Some(2);
+        notebook.cells[1].outputs = vec![CellOutput::Stream {
+            name: "stdout".to_string(),
+            text: "1\n".to_string(),
+        }];
 
-        let rendered = NotebookStorage::render_markdown(&notebook);
-        let parsed = NotebookStorage::parse_markdown(&rendered).unwrap();
+        let rendered = NotebookStorage::render_smd(&notebook);
+        let parsed = NotebookStorage::parse_smd(&rendered).unwrap();
 
         assert_eq!(parsed.metadata.title, "Demo");
         assert_eq!(parsed.cells.len(), 3);
         assert_eq!(parsed.cells[1].kind, CellKind::Code);
         assert_eq!(parsed.cells[1].language, Language::Python);
         assert_eq!(parsed.cells[1].source, "value = 1\nprint(value)");
+        assert_eq!(parsed.cells[1].execution_count, Some(2));
+        assert_eq!(parsed.cells[1].primary_output_text(), "1\n");
         assert_eq!(parsed.cells[2].kind, CellKind::Raw);
     }
 
