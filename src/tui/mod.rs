@@ -1124,11 +1124,13 @@ impl App {
         frame.render_widget(Paragraph::new(chrome), chrome_area);
         self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
 
+        let available_body_height = inner.height.saturating_sub(1);
+        let input_height = self.input_height(cell, index).min(available_body_height);
         let input_area = Rect {
             x: inner.x,
             y: inner.y + 1,
             width: inner.width,
-            height: self.input_height(cell, index),
+            height: input_height,
         };
         let inner_input = shrink(input_area, 1);
         let title = match cell.kind {
@@ -1209,11 +1211,15 @@ impl App {
 
         let output_collapsed = self.cell_mode(cell).output_collapsed;
         if !cell.outputs.is_empty() && !output_collapsed {
+            let available_output_height = inner
+                .height
+                .saturating_sub(1)
+                .saturating_sub(input_area.height);
             let output_area = Rect {
                 x: inner.x + 2,
                 y: inner.y + 1 + input_area.height,
                 width: inner.width.saturating_sub(2),
-                height: self.output_height(cell).min(inner.height.saturating_sub(1 + input_area.height)),
+                height: self.output_height(cell).min(available_output_height),
             };
             let output_selected = selected && self.copy_target == CopyTarget::CellOutput;
             let output_text = render_output_block(cell, &self.theme);
@@ -2569,6 +2575,8 @@ fn shrink(rect: Rect, amount: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use crate::clipboard::Clipboard;
     use crate::runtime::SessionManager;
     use crate::theme::Theme;
@@ -2888,6 +2896,21 @@ mod tests {
         let app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         assert_eq!(app.input_height(&app.notebook.cells[0], 0), 26);
+    }
+
+    #[test]
+    fn drawing_long_cell_does_not_render_past_frame() {
+        let source = (0..80)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook = Notebook::new("LongDraw").with_cells(vec![Cell::code(Language::Python, source)]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
     }
 
     #[test]
