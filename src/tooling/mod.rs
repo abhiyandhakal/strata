@@ -2,12 +2,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use serde_json::{Value, json};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::core::Language;
+use crate::theme::{SyntaxTokenKind, Theme};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PythonLspStatus {
@@ -185,8 +186,12 @@ pub struct SyntaxHighlighter;
 
 impl SyntaxHighlighter {
     pub fn highlight(language: Language, source: &str) -> Text<'static> {
+        Self::highlight_with_theme(language, source, &Theme::default_theme())
+    }
+
+    pub fn highlight_with_theme(language: Language, source: &str, theme: &Theme) -> Text<'static> {
         match parse_tree(language, source) {
-            Some(tree) => render_tree(language, source, &tree),
+            Some(tree) => render_tree(language, source, &tree, theme),
             None => Text::from(
                 source
                     .lines()
@@ -217,9 +222,9 @@ fn parse_tree(language: Language, source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-fn render_tree(language: Language, source: &str, tree: &Tree) -> Text<'static> {
+fn render_tree(language: Language, source: &str, tree: &Tree, theme: &Theme) -> Text<'static> {
     let mut spans = Vec::new();
-    collect_leaf_spans(language, tree.root_node(), &mut spans);
+    collect_leaf_spans(language, tree.root_node(), theme, &mut spans);
     spans.sort_by_key(|span| (span.start, span.end));
 
     let mut lines = Vec::new();
@@ -262,9 +267,14 @@ fn render_tree(language: Language, source: &str, tree: &Tree) -> Text<'static> {
     Text::from(lines)
 }
 
-fn collect_leaf_spans(language: Language, node: Node<'_>, spans: &mut Vec<HighlightSpan>) {
+fn collect_leaf_spans(
+    language: Language,
+    node: Node<'_>,
+    theme: &Theme,
+    spans: &mut Vec<HighlightSpan>,
+) {
     if node.child_count() == 0 {
-        if let Some(style) = style_for_node(language, node.kind()) {
+        if let Some(style) = style_for_node(language, node.kind(), theme) {
             spans.push(HighlightSpan {
                 start: node.start_byte(),
                 end: node.end_byte(),
@@ -276,29 +286,27 @@ fn collect_leaf_spans(language: Language, node: Node<'_>, spans: &mut Vec<Highli
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_leaf_spans(language, child, spans);
+        collect_leaf_spans(language, child, theme, spans);
     }
 }
 
-fn style_for_node(language: Language, kind: &str) -> Option<Style> {
+fn style_for_node(language: Language, kind: &str, theme: &Theme) -> Option<Style> {
     let style = if kind.contains("comment") {
-        Style::default().fg(Color::DarkGray)
+        theme.syntax_style(SyntaxTokenKind::Comment)
     } else if kind.contains("string") || kind == "string_fragment" {
-        Style::default().fg(Color::Green)
+        theme.syntax_style(SyntaxTokenKind::String)
     } else if kind.contains("number") || kind == "integer" || kind == "float" {
-        Style::default().fg(Color::Cyan)
+        theme.syntax_style(SyntaxTokenKind::Number)
     } else if kind.contains("type") || kind == "predefined_type" {
-        Style::default().fg(Color::Yellow)
+        theme.syntax_style(SyntaxTokenKind::TypeName)
     } else if is_keyword(language, kind) {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
+        theme.syntax_style(SyntaxTokenKind::Keyword)
     } else if kind.contains("function")
         || kind == "identifier"
         || kind == "property_identifier"
         || kind == "variable_name"
     {
-        Style::default().fg(Color::LightBlue)
+        theme.syntax_style(SyntaxTokenKind::Identifier)
     } else {
         return None;
     };
@@ -394,6 +402,19 @@ mod tests {
 
         assert!(rendered.contains("def"));
         assert!(rendered.contains("return"));
+    }
+
+    #[test]
+    fn tree_sitter_highlighter_accepts_custom_theme() {
+        let theme = Theme::default_theme();
+        let highlighted = SyntaxHighlighter::highlight_with_theme(
+            Language::Python,
+            "value = 'hi'",
+            &theme,
+        );
+
+        let rendered = format!("{highlighted:?}");
+        assert!(rendered.contains("hi"));
     }
 
     #[test]

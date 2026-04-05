@@ -8,12 +8,19 @@ use serde::Deserialize;
 pub struct StrataConfig {
     #[serde(default)]
     pub editor: EditorConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct EditorConfig {
     #[serde(default)]
     pub vim_mode: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ThemeConfig {
+    pub path: Option<String>,
 }
 
 impl StrataConfig {
@@ -111,6 +118,16 @@ mod tests {
 
         let config = load_from_path(&path).unwrap();
         assert!(config.editor.vim_mode);
+    }
+
+    #[test]
+    fn config_reads_theme_path_from_toml() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[theme]\npath = \"themes/ocean\"\n").unwrap();
+
+        let config = load_from_path(&path).unwrap();
+        assert_eq!(config.theme.path.as_deref(), Some("themes/ocean"));
     }
 
     #[test]

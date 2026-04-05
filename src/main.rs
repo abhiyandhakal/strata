@@ -8,6 +8,7 @@ use strata::runtime::{
     load_session_for_notebook, run_notebook_cells, summarize_records,
 };
 use strata::storage::{CheckpointPaths, CheckpointStorage, NotebookFormat, NotebookStorage};
+use strata::theme::ThemeResolver;
 use strata::tui::{App, should_launch_tui};
 
 #[derive(Parser)]
@@ -64,7 +65,17 @@ fn open_or_run_command(path: PathBuf) -> Result<()> {
     let mut session = load_session_for_notebook(&path, &notebook)?;
 
     if should_launch_tui() {
-        App::new(notebook, Some(path), session, config.editor.vim_mode).run()?;
+        let resolution =
+            ThemeResolver::from_env().resolve(config.theme.path.as_deref(), Some(&path));
+        App::new(
+            notebook,
+            Some(path),
+            session,
+            config.editor.vim_mode,
+            resolution.theme,
+            resolution.warning,
+        )
+        .run()?;
     } else {
         let checkpoint_paths = CheckpointPaths::for_notebook(&path);
         let records = run_notebook_cells(&mut session, &mut notebook)

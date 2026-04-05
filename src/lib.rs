@@ -3,5 +3,6 @@ pub mod config;
 pub mod core;
 pub mod runtime;
 pub mod storage;
+pub mod theme;
 pub mod tooling;
 pub mod tui;

@@ -15,7 +15,7 @@ use crossterm::terminal::{
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -26,6 +26,7 @@ use crate::core::{
 };
 use crate::runtime::SessionManager;
 use crate::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
+use crate::theme::Theme;
 use crate::tooling::{PythonLspClient, PythonLspStatus, SyntaxHighlighter};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,14 +406,13 @@ impl VimState {
         }
     }
 
-    fn cursor_style(&self) -> Style {
-        let color = match self.mode {
-            VimMode::Normal => Color::Reset,
-            VimMode::Insert => Color::LightBlue,
-            VimMode::Visual => Color::LightYellow,
-            VimMode::Operator(_) => Color::LightGreen,
-        };
-        Style::default().fg(color).add_modifier(Modifier::REVERSED)
+    fn cursor_style(&self, theme: &Theme) -> Style {
+        match self.mode {
+            VimMode::Normal => theme.style("editor.cursor.normal"),
+            VimMode::Insert => theme.style("editor.cursor.insert"),
+            VimMode::Visual => theme.style("editor.cursor.visual"),
+            VimMode::Operator(_) => theme.style("editor.cursor.operator"),
+        }
     }
 }
 
@@ -459,6 +459,7 @@ pub struct App {
     python_lsp_client: Option<PythonLspClient>,
     notebook_area: Rect,
     last_click: Option<(usize, Instant)>,
+    theme: Theme,
 }
 
 impl App {
@@ -467,6 +468,8 @@ impl App {
         notebook_path: Option<PathBuf>,
         session: SessionManager,
         vim_enabled: bool,
+        theme: Theme,
+        startup_notice: Option<String>,
     ) -> Self {
         let checkpoint_paths = notebook_path
             .as_ref()
@@ -505,10 +508,14 @@ impl App {
             python_lsp_client: None,
             notebook_area: Rect::default(),
             last_click: None,
+            theme,
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
         app.refresh_status();
+        if let Some(notice) = startup_notice {
+            app.status = notice;
+        }
         app
     }
 
@@ -723,24 +730,32 @@ impl App {
         self.clamp_scroll_offset();
         self.draw_notebook(frame, chunks[1]);
         let status = Paragraph::new(self.status.as_str())
+            .style(self.theme.style("status.body"))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::TOP)
-                    .title(Line::styled("Status", Style::default().add_modifier(Modifier::BOLD))),
+                    .border_style(self.theme.style("cell.border"))
+                    .title(Line::styled("Status", self.theme.style("status.title"))),
             );
         frame.render_widget(status, chunks[2]);
 
     }
 
     fn draw_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(format!(
-            "{} | kernel={} | mode={:?} | {}",
-            self.notebook.metadata.title,
-            self.notebook.metadata.kernelspec.display_name,
-            self.mode,
-            self.python_lsp.summary()
-        ));
+        let title = Line::from(vec![
+            Span::raw(format!(
+                "{} | kernel={} | mode={:?} | ",
+                self.notebook.metadata.title, self.notebook.metadata.kernelspec.display_name, self.mode
+            )),
+            Span::styled(self.python_lsp.summary(), self.python_lsp_style()),
+            Span::raw(format!(" | theme={}", self.theme.name())),
+        ]);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .style(self.theme.style("toolbar.block"))
+            .border_style(self.theme.style("toolbar.border"))
+            .title(title);
         frame.render_widget(block, area);
         let inner = Rect {
             x: area.x + 1,
@@ -749,15 +764,15 @@ impl App {
             height: area.height.saturating_sub(2),
         };
         let mut spans = vec![
-            Span::styled("[Save]", Style::default().fg(Color::Yellow)),
+            Span::styled("[Save]", self.theme.style("toolbar.button.save")),
             Span::raw(" "),
-            Span::styled("[Run All]", Style::default().fg(Color::Green)),
+            Span::styled("[Run All]", self.theme.style("toolbar.button.run_all")),
             Span::raw(" "),
-            Span::styled("[Restart]", Style::default().fg(Color::Red)),
+            Span::styled("[Restart]", self.theme.style("toolbar.button.restart")),
             Span::raw(" "),
-            Span::styled("[+ Code]", Style::default().fg(Color::Cyan)),
+            Span::styled("[+ Code]", self.theme.style("toolbar.button.add_code")),
             Span::raw(" "),
-            Span::styled("[+ Markdown]", Style::default().fg(Color::Blue)),
+            Span::styled("[+ Markdown]", self.theme.style("toolbar.button.add_markdown")),
         ];
         let toolbar = Paragraph::new(Line::from(std::mem::take(&mut spans)));
         frame.render_widget(toolbar, inner);
@@ -787,7 +802,14 @@ impl App {
         if self.notebook.cells.is_empty() {
             frame.render_widget(
                 Paragraph::new("No cells. Use [+ Code] or [+ Markdown].")
-                    .block(Block::default().borders(Borders::ALL).title("Notebook")),
+                    .style(self.theme.style("notebook.empty"))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .style(self.theme.style("cell.shell"))
+                            .border_style(self.theme.style("cell.border"))
+                            .title("Notebook"),
+                    ),
                 area,
             );
             return;
@@ -829,16 +851,14 @@ impl App {
     ) {
         let selected = index == self.selected;
         let shell_style = if selected {
-            Style::default().bg(Color::Rgb(20, 34, 46))
+            self.theme.style("cell.shell.selected")
         } else {
-            Style::default().bg(Color::Rgb(10, 14, 20))
+            self.theme.style("cell.shell")
         };
         let border_style = if selected {
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD)
+            self.theme.style("cell.border.selected")
         } else {
-            Style::default().fg(Color::DarkGray)
+            self.theme.style("cell.border")
         };
         frame.render_widget(
             Block::default()
@@ -852,9 +872,9 @@ impl App {
             return;
         }
         let chrome_style = if selected {
-            Style::default().fg(Color::Black).bg(Color::LightCyan).add_modifier(Modifier::BOLD)
+            self.theme.style("cell.prompt.selected")
         } else {
-            Style::default().fg(Color::Gray)
+            self.theme.style("cell.prompt")
         };
         let prompt = match cell.kind {
             CellKind::Code => format!("In [{}]:", cell.execution_count.map_or(" ".to_string(), |n| n.to_string())),
@@ -865,7 +885,7 @@ impl App {
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
         let mut chrome_spans = vec![Span::styled(prompt, chrome_style), Span::raw(" ")];
         if is_executable(cell) {
-            chrome_spans.push(Span::styled("[Run]", Style::default().fg(Color::Green)));
+            chrome_spans.push(Span::styled("[Run]", self.theme.style("cell.button.run")));
             chrome_spans.push(Span::raw(" "));
         }
         chrome_spans.push(Span::styled(
@@ -875,15 +895,15 @@ impl App {
                 }
                 _ => "[Edit]",
             },
-            Style::default().fg(Color::Yellow),
+            self.theme.style("cell.button.edit"),
         ));
         chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled("[+]", Style::default().fg(Color::Cyan)));
+        chrome_spans.push(Span::styled("[+]", self.theme.style("cell.button.add")));
         chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled("[Del]", Style::default().fg(Color::Red)));
+        chrome_spans.push(Span::styled("[Del]", self.theme.style("cell.button.delete")));
         if !cell.outputs.is_empty() {
             chrome_spans.push(Span::raw(" "));
-            chrome_spans.push(Span::styled("[Out]", Style::default().fg(Color::Blue)));
+            chrome_spans.push(Span::styled("[Out]", self.theme.style("cell.button.output")));
         }
         let chrome = Line::from(chrome_spans);
         let chrome_area = Rect {
@@ -928,8 +948,8 @@ impl App {
             self.hit_regions.push(HitRegion { rect: input_area, target: HitTarget::CellEditor(index) });
         } else {
             let content = match cell.kind {
-                CellKind::Markdown if rendered => render_markdown_block(&cell.source),
-                CellKind::Code => render_code_block(cell),
+                CellKind::Markdown if rendered => render_markdown_block(&cell.source, &self.theme),
+                CellKind::Code => render_code_block(cell, &self.theme),
                 _ => Text::from(cell.source.clone()),
             };
             let block = Paragraph::new(content)
@@ -956,9 +976,16 @@ impl App {
                 width: inner.width.saturating_sub(2),
                 height: self.output_height(cell).min(inner.height.saturating_sub(1 + input_area.height)),
             };
-            let output = Paragraph::new(render_output_block(cell))
+            let output = Paragraph::new(render_output_block(cell, &self.theme))
+                .style(self.theme.style("output.block"))
                 .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title("Output"));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(self.theme.style("output.block"))
+                        .border_style(self.theme.style("output.border"))
+                        .title("Output"),
+                );
             if output_area.height > 0 && output_area.y < viewport.y + viewport.height {
                 frame.render_widget(output, output_area);
             }
@@ -982,7 +1009,7 @@ impl App {
             self.editor = TextArea::from(cell.source.lines().map(|line| line.to_string()));
         }
         self.editor
-            .set_cursor_line_style(Style::default().add_modifier(Modifier::REVERSED));
+            .set_cursor_line_style(self.theme.style("editor.cursor_line"));
         if self.mode == AppMode::Edit && self.vim_enabled {
             self.vim = Some(VimState::new(VimMode::Normal));
         }
@@ -1169,10 +1196,10 @@ impl App {
 
     fn sync_editor_presentation(&mut self) {
         self.editor
-            .set_cursor_line_style(Style::default().add_modifier(Modifier::REVERSED));
+            .set_cursor_line_style(self.theme.style("editor.cursor_line"));
         let cursor_style = match self.vim.as_ref() {
-            Some(vim) => vim.cursor_style(),
-            None => Style::default().add_modifier(Modifier::REVERSED),
+            Some(vim) => vim.cursor_style(&self.theme),
+            None => self.theme.style("editor.cursor.normal"),
         };
         self.editor.set_cursor_style(cursor_style);
     }
@@ -1342,7 +1369,7 @@ impl App {
     }
 
     fn output_height(&self, cell: &Cell) -> u16 {
-        let lines = render_output_block(cell).lines.len().max(1);
+        let lines = render_output_block(cell, &self.theme).lines.len().max(1);
         (lines as u16).min(8) + 2
     }
 
@@ -1382,6 +1409,14 @@ impl App {
             cursor_y = cursor_y.saturating_add(height);
         }
     }
+
+    fn python_lsp_style(&self) -> Style {
+        match self.python_lsp {
+            PythonLspStatus::Active { .. } => self.theme.style("lsp.active"),
+            PythonLspStatus::Available { .. } => self.theme.style("lsp.available"),
+            PythonLspStatus::Unavailable => self.theme.style("lsp.unavailable"),
+        }
+    }
 }
 
 pub fn should_launch_tui() -> bool {
@@ -1413,18 +1448,18 @@ fn input_from_key_event(key: KeyEvent) -> Input {
     }
 }
 
-fn render_markdown_block(source: &str) -> Text<'static> {
+fn render_markdown_block(source: &str, theme: &Theme) -> Text<'static> {
     let mut lines = Vec::new();
     for line in source.lines() {
         if let Some(rest) = line.strip_prefix("# ") {
             lines.push(Line::from(vec![Span::styled(
                 rest.to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                theme.style("markdown.heading1"),
             )]));
         } else if let Some(rest) = line.strip_prefix("## ") {
             lines.push(Line::from(vec![Span::styled(
                 rest.to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                theme.style("markdown.heading2"),
             )]));
         } else {
             lines.push(Line::from(line.to_string()));
@@ -1436,18 +1471,18 @@ fn render_markdown_block(source: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-fn render_code_block(cell: &Cell) -> Text<'static> {
-    SyntaxHighlighter::highlight(cell.language, &cell.source)
+fn render_code_block(cell: &Cell, theme: &Theme) -> Text<'static> {
+    SyntaxHighlighter::highlight_with_theme(cell.language, &cell.source, theme)
 }
 
-fn render_output_block(cell: &Cell) -> Text<'static> {
+fn render_output_block(cell: &Cell, theme: &Theme) -> Text<'static> {
     let mut lines = Vec::new();
     for output in &cell.outputs {
         match output {
             CellOutput::Stream { name, text } => {
                 lines.push(Line::from(vec![Span::styled(
                     format!("{name}:"),
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    theme.style("output.stream.label"),
                 )]));
                 for line in text.lines() {
                     lines.push(Line::from(line.to_string()));
@@ -1460,7 +1495,7 @@ fn render_output_block(cell: &Cell) -> Text<'static> {
             } => {
                 lines.push(Line::from(vec![Span::styled(
                     format!("Out [{execution_count}]:"),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    theme.style("output.result.label"),
                 )]));
                 if let Some(value) = data.get("text/plain") {
                     for line in value.as_str().unwrap_or_default().lines() {
@@ -1482,12 +1517,12 @@ fn render_output_block(cell: &Cell) -> Text<'static> {
             } => {
                 lines.push(Line::from(vec![Span::styled(
                     format!("{ename}: {evalue}"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    theme.style("output.error.label"),
                 )]));
                 for line in traceback {
                     lines.push(Line::from(Span::styled(
                         line.clone(),
-                        Style::default().fg(Color::LightRed),
+                        theme.style("output.error.trace"),
                     )));
                 }
             }
@@ -1537,6 +1572,7 @@ fn shrink(rect: Rect, amount: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::runtime::SessionManager;
+    use crate::theme::Theme;
     use tempfile::TempDir;
 
     #[test]
@@ -1544,7 +1580,7 @@ mod tests {
         let notebook =
             Notebook::new("Edit").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
             .unwrap();
@@ -1567,7 +1603,14 @@ mod tests {
         let path = temp.path().join("demo.smd");
         let notebook = Notebook::new("Save").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, Some(path.clone()), session, false);
+        let mut app = App::new(
+            notebook,
+            Some(path.clone()),
+            session,
+            false,
+            Theme::default_theme(),
+            None,
+        );
 
         app.save_all().unwrap();
 
@@ -1580,7 +1623,7 @@ mod tests {
     fn vim_mode_can_be_toggled_in_session() {
         let notebook = Notebook::new("Vim").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
             .unwrap();
@@ -1595,7 +1638,7 @@ mod tests {
             .with_cells(vec![Cell::code(Language::Python, "print('hello')")]);
         let mut session = SessionManager::new(&notebook);
         session.register_default_kernels().unwrap();
-        let mut app = App::new(notebook, None, session, false);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         app.run_selected_cell().unwrap();
 
@@ -1607,7 +1650,7 @@ mod tests {
     fn inserting_into_empty_notebook_creates_markdown_cell() {
         let notebook = Notebook::new("Empty");
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         app.insert_markdown_cell();
 
@@ -1619,7 +1662,7 @@ mod tests {
     fn markdown_cells_are_not_executable() {
         let notebook = Notebook::new("Doc").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         let result = app.run_selected_cell();
 
@@ -1633,7 +1676,7 @@ mod tests {
             .collect::<Vec<_>>();
         let notebook = Notebook::new("Scroll").with_cells(cells);
         let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
         app.notebook_area = Rect {
             x: 0,
             y: 0,
