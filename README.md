@@ -1,42 +1,45 @@
 # Strata
 
-Strata is now being reshaped into a terminal-native notebook that deliberately follows the Jupyter notebook model and interaction style.
+Strata is a terminal-native notebook environment with a custom Markdown-based notebook format and a notebook-style TUI.
 
 Current product slice:
 
-- `.ipynb`-first notebook storage with nbformat-style cells and outputs
-- Python-first notebook execution with inline execution counts and output blocks
-- A vertical notebook TUI instead of the older split-pane editor
-- Mouse support for toolbar actions, cell focus, per-cell buttons, scrolling, and editor cursor placement
-- Tree-sitter-backed syntax highlighting for Python, Bash, JavaScript, and TypeScript
-- Python LSP activation path for Basedpyright / Pyright-style servers when available
-- Checkpoint sidecars for resumable runtime state and notebook UI state
+- `.smd` as the primary working notebook format
+- explicit `.ipynb <-> .smd` conversion commands
+- a vertical notebook UI with selection-first interaction
+- mouse support for selecting cells, toolbar actions, scrolling, and editor cursor placement
+- tree-sitter syntax highlighting for Python, Bash, JavaScript, and TypeScript
+- Python LSP activation for Basedpyright / Pyright-compatible servers when available
+- checkpoint sidecars for runtime and notebook UI state
 
 ## Run
 
-Open the notebook UI:
+Open a Strata notebook:
 
 ```bash
-cargo run -- path/to/notebook.ipynb
+cargo run -- path/to/notebook.smd
 ```
 
-Run a notebook headlessly in a non-interactive context:
+The same command behaves differently depending on the environment:
 
-```bash
-cargo run -- path/to/notebook.ipynb
-```
-
-The public CLI now only accepts a notebook path. In a real terminal it opens the notebook UI; in non-interactive use it executes the notebook and prints a summary.
+- interactive terminal: opens the notebook UI
+- non-interactive use: executes the notebook headlessly and prints a summary
 
 ## Install As A Command
 
-To install `strata` so it can be run from anywhere without `cargo run` or a binary path:
+Install `strata` onto your `PATH`:
 
 ```bash
 ./scripts/install-local.sh
 ```
 
-That builds the release binary and installs it to `~/.local/bin/strata` by default.
+By default this installs to `~/.local/bin/strata`.
+
+If `~/.local/bin` is already on `PATH`, you can then run:
+
+```bash
+strata path/to/notebook.smd
+```
 
 Override the install location if needed:
 
@@ -44,70 +47,115 @@ Override the install location if needed:
 STRATA_INSTALL_DIR=/some/bin ./scripts/install-local.sh
 ```
 
-If your shell already has `~/.local/bin` on `PATH`, you can then run:
-
-```bash
-strata --help
-strata path/to/notebook.ipynb
-```
-
 ## Notebook Format
 
-Strata now treats `.ipynb` as the primary notebook format.
+Strata now uses `.smd` as the primary notebook format.
 
-Supported visible cell types:
+`.smd` is Markdown-based and human-editable, but uses explicit Strata metadata comments so notebook structure round-trips cleanly.
 
-- `code`
-- `markdown`
-- `raw`
+The format stores:
 
-Code-cell execution results are written back into the notebook as:
+- notebook metadata
+- markdown, code, raw, and AI cells
+- cell ids
+- execution counts
+- text outputs and errors where representable
 
-- `execution_count`
-- structured outputs
-- error output blocks
+The main workflow is intentionally centered on `.smd`, not `.ipynb`.
 
-Markdown-backed Strata notebooks still load for compatibility, but the notebook redesign is centered on `.ipynb`.
+## Import And Export
+
+Import an `.ipynb` notebook into Strata format:
+
+```bash
+strata import path/to/notebook.ipynb
+strata import path/to/notebook.ipynb path/to/notebook.smd
+```
+
+Export a Strata notebook to `.ipynb`:
+
+```bash
+strata export path/to/notebook.smd
+strata export path/to/notebook.smd path/to/notebook.ipynb
+```
+
+Direct notebook opening is for `.smd`:
+
+```bash
+strata path/to/notebook.smd
+```
+
+If you want to work from an `.ipynb`, import it first.
 
 ## TUI Workflow
 
-When launched in a real terminal, Strata opens a notebook-style document view:
+The notebook UI is selection-first.
 
-- top toolbar with save, run-all, restart, and insert-cell actions
-- vertically stacked cells
-- per-cell chrome with run / render / insert / delete / output toggle controls
-- inline outputs directly below each code cell
+Cell interaction:
+
+- single click selects a cell
+- double click enters edit mode
+- `j` / `k` move the selected cell
+- `e` or `Enter` enters edit mode for the selected cell
+- `Esc` exits edit mode back to cell selection
+
+Selected cells are highlighted as whole notebook cards, not just with an inner border.
+
+Toolbar actions:
+
+- `[Save]`
+- `[Run All]`
+- `[Restart]`
+- `[+ Code]`
+- `[+ Markdown]`
+
+Per-cell actions:
+
+- executable cells: `[Run]`, `[Edit]`, `[+]`, `[Del]`, `[Out]`
+- markdown cells: `[Edit]` or `[Render]`, `[+]`, `[Del]`, `[Out]` when output exists
+
+Markdown cells do not show a run button.
 
 Keyboard flow:
 
-- `j` / `k`: move cell focus
-- `e` or `Enter`: edit focused cell
-- `r`: run focused cell
+- `j` / `k`: move selection
+- `e` or `Enter`: edit selected cell
+- `r`: run selected executable cell
 - `R`: run all executable cells
 - `c`: insert a Python code cell below
 - `m`: insert a Markdown cell below
-- `d` or `Delete`: delete focused cell
-- `o`: collapse or expand focused cell output
+- `d` or `Delete`: delete selected cell
+- `o`: collapse or expand selected cell output
 - `Ctrl-S`: save notebook and checkpoint
 - `q`: quit
 
 Mouse flow:
 
 - click a cell to select it
-- click cell toolbar buttons to run, toggle render, insert, delete, or collapse output
-- click toolbar buttons for save, run-all, restart, and insert-cell actions
-- use the scroll wheel to move through the notebook
-- click inside the editor to position the cursor
-- drag in the editor to select text
+- double click a cell body to edit it
+- click cell buttons for edit/render, run, insert, delete, and output toggle
+- use the scroll wheel to move through notebook cells
+- click inside the editor to place the cursor
+- drag inside the editor to select text
 
-## Editing and Vim Mode
+## Scrolling And Bounds
 
-The document UI still supports the existing editor-mode vim toggle.
+The notebook viewport is cell-based and clamped so it does not draw content beyond the visible terminal area.
+
+Current behavior:
+
+- notebook scrolling advances through cells safely
+- selected cells are kept visible
+- long cell bodies and outputs are height-limited in the notebook view
+- narrow or short terminals clip safely instead of drawing out of bounds
+
+## Editing And Vim Mode
+
+The notebook editor still supports the optional vim mode for cell editing.
 
 Config:
 
 ```toml
-# ~/.config/strata/config.toml
 [editor]
 vim_mode = true
 ```
@@ -119,22 +167,22 @@ export STRATA_CONFIG_PATH=/path/to/config.toml
 export STRATA_VIM_MODE=1
 ```
 
-With vim mode enabled, entering edit mode starts the cell editor in vim `NORMAL`.
+When vim mode is enabled, entering edit mode starts the cell editor in vim `NORMAL`.
 
 ## Syntax Highlighting
 
-Syntax highlighting is now driven by tree-sitter grammars for:
+Syntax highlighting is powered by tree-sitter grammars for:
 
 - Python
 - Bash
 - JavaScript
 - TypeScript
 
-Markdown cells render as formatted notebook content when not editing and switch back to plain text while editing.
+Markdown cells render as notebook prose when not editing and switch to plain text during editing.
 
 ## Python LSP
 
-Strata now detects and attempts to activate a Python language server for the notebook UI.
+Strata detects and attempts to activate a Python language server for the notebook UI.
 
 Discovery order:
 
@@ -143,49 +191,46 @@ Discovery order:
 3. `pyright-langserver`
 4. `npx --yes basedpyright-langserver --stdio`
 
-The toolbar reports whether Python LSP is available or active. The current code activates the server process and performs the LSP initialize handshake so the UI can build on a real server connection.
+The toolbar reports whether Python LSP is available or active. The current code activates the server process and performs the initialize handshake so the editor can build on a real LSP session.
 
-## Runtime and Checkpoints
+## Runtime And Checkpoints
 
-Strata keeps runtime state in a sidecar checkpoint directory:
+Strata keeps runtime state in:
 
 ```text
 .strata/<notebook-stem>/session.json
 ```
 
-Checkpoint state currently includes:
+Checkpoint state includes:
 
 - named values and execution history
 - AI history
 - next execution counter
-- notebook UI state such as selected cell, viewport, and rendered/collapsed cell modes
+- notebook UI state such as selected cell, viewport position, and rendered/collapsed cell modes
 
 Opening an existing notebook rehydrates language runtime state by replaying prior successful code-cell executions.
 
 ## Current Scope
 
-This redesign is intentionally Jupyter-shaped first.
-
 Included now:
 
-- `.ipynb` model and persistence
-- notebook-style TUI
-- inline outputs and execution counts
-- mouse-driven notebook interactions
+- `.smd` notebook storage
+- `.ipynb` import and export
+- notebook-style TUI with selection-first interaction
+- markdown cells without run controls
+- safer scrolling and viewport clamping
 - tree-sitter syntax highlighting
 - Python LSP activation path
 
 Still incomplete:
 
 - full Jupyter shortcut parity
-- rich MIME output rendering beyond text-first terminal fallbacks
-- notebook-wide drag-reorder via mouse
-- surfaced LSP UX like completion popups, hover panes, rename, references, and code actions
-- full removal of older Strata-specific AI and multi-language notebook assumptions from every internal layer
+- rich MIME output rendering beyond terminal text fallbacks
+- mouse drag-reorder for cells
+- surfaced LSP UX like completion menus, hover panes, rename, references, and code actions
+- full cleanup of older Strata-specific AI and multi-language assumptions in every internal layer
 
 ## Verification
-
-Current verification commands:
 
 ```bash
 cargo test --quiet
@@ -193,10 +238,12 @@ cargo test --quiet
 
 That suite covers:
 
-- Markdown and `.ipynb` storage round-trips
+- `.smd` parse/render round-trips
+- `.ipynb` parse/render round-trips
 - checkpoint persistence
 - runtime hydration
-- CLI notebook execution
+- `.smd` notebook execution
+- import/export conversion commands
 - AI provider integration mocks
 - tree-sitter highlighter scaffolding
-- notebook TUI editing and execution flows
+- notebook TUI editing, selection, and scrolling behavior
