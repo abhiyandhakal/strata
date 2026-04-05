@@ -17,16 +17,16 @@ Current product slice:
 Open the notebook UI:
 
 ```bash
-cargo run -- open path/to/notebook.ipynb
+cargo run -- path/to/notebook.ipynb
 ```
 
-Run a notebook headlessly:
+Run a notebook headlessly in a non-interactive context:
 
 ```bash
-cargo run -- run path/to/notebook.ipynb
+cargo run -- path/to/notebook.ipynb
 ```
 
-If no path is provided, Strata opens an in-memory demo notebook.
+The public CLI now only accepts a notebook path. In a real terminal it opens the notebook UI; in non-interactive use it executes the notebook and prints a summary.
 
 ## Install As A Command
 
@@ -48,7 +48,7 @@ If your shell already has `~/.local/bin` on `PATH`, you can then run:
 
 ```bash
 strata --help
-strata open path/to/notebook.ipynb
+strata path/to/notebook.ipynb
 ```
 
 ## Notebook Format

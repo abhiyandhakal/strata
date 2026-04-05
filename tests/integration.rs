@@ -300,7 +300,6 @@ console.log(strata.input("shared"))
 
     Command::cargo_bin("strata")
         .unwrap()
-        .arg("run")
         .arg(&notebook_path)
         .assert()
         .success()
@@ -339,7 +338,6 @@ console.log(globalThis.count);
 
     Command::cargo_bin("strata")
         .unwrap()
-        .arg("run")
         .arg(&notebook_path)
         .assert()
         .success()
@@ -358,7 +356,6 @@ fn cli_run_updates_ipynb_outputs_and_execution_counts() {
 
     Command::cargo_bin("strata")
         .unwrap()
-        .arg("run")
         .arg(&notebook_path)
         .assert()
         .success()
@@ -392,7 +389,6 @@ Explain this notebook
         .unwrap()
         .env_remove("OPENAI_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")
-        .arg("run")
         .arg(&notebook_path)
         .assert()
         .success()
