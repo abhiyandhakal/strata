@@ -759,37 +759,6 @@ impl App {
                 return Ok(());
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.mode == AppMode::Command {
-                    if let Some(region) = self.content_region_at(mouse.column, mouse.row).cloned() {
-                        let is_double_click = self
-                            .last_click
-                            .as_ref()
-                            .map(|(last_index, last_time)| {
-                                *last_index == region.cell_index
-                                    && last_time.elapsed() <= Duration::from_millis(350)
-                            })
-                            .unwrap_or(false);
-                        self.last_click = Some((region.cell_index, Instant::now()));
-                        self.selected = region.cell_index;
-                        self.copy_target = region.target;
-                        self.load_selected_into_editor();
-                        self.ensure_selected_visible();
-                        if is_double_click && region.target == CopyTarget::CellBody {
-                            self.clear_mouse_text_selection();
-                            self.enter_edit_mode();
-                        } else {
-                            let point = text_point_from_mouse(&region, mouse.column, mouse.row, self);
-                            self.mouse_text_selection = Some(MouseTextSelection {
-                                cell_index: region.cell_index,
-                                target: region.target,
-                                anchor: point,
-                                focus: point,
-                            });
-                            self.drag_content_selection = true;
-                        }
-                        return Ok(());
-                    }
-                }
                 if let Some(target) = self.hit_test(mouse.column, mouse.row) {
                     match target.clone() {
                         HitTarget::CellEditor(index)
@@ -798,7 +767,7 @@ impl App {
                             self.drag_selection = true;
                             self.activate_hit_target(target, mouse.column, mouse.row)?;
                         }
-                        HitTarget::CellSelect(index) | HitTarget::CellEditor(index) => {
+                        HitTarget::CellEditor(index) if self.mode == AppMode::Command => {
                             let is_double_click = self
                                 .last_click
                                 .as_ref()
@@ -815,17 +784,47 @@ impl App {
                             self.ensure_selected_visible();
                             if is_double_click {
                                 self.enter_edit_mode();
-                                if matches!(target, HitTarget::CellEditor(_)) {
-                                    if let Some(rect) = self.active_editor_rect {
-                                        self.place_editor_cursor(
-                                            mouse.column,
-                                            mouse.row,
-                                            rect,
-                                            false,
-                                        );
-                                    }
-                                }
+                            } else if let Some(region) =
+                                self.content_region_at(mouse.column, mouse.row).cloned()
+                            {
+                                let point =
+                                    text_point_from_mouse(&region, mouse.column, mouse.row, self);
+                                self.mouse_text_selection = Some(MouseTextSelection {
+                                    cell_index: region.cell_index,
+                                    target: CopyTarget::CellBody,
+                                    anchor: point,
+                                    focus: point,
+                                });
+                                self.drag_content_selection = true;
                             }
+                        }
+                        HitTarget::CellOutput(index) if self.mode == AppMode::Command => {
+                            self.selected = index;
+                            self.copy_target = CopyTarget::CellOutput;
+                            self.clear_mouse_text_selection();
+                            self.load_selected_into_editor();
+                            self.ensure_selected_visible();
+                            if let Some(region) =
+                                self.content_region_at(mouse.column, mouse.row).cloned()
+                            {
+                                let point =
+                                    text_point_from_mouse(&region, mouse.column, mouse.row, self);
+                                self.mouse_text_selection = Some(MouseTextSelection {
+                                    cell_index: region.cell_index,
+                                    target: CopyTarget::CellOutput,
+                                    anchor: point,
+                                    focus: point,
+                                });
+                                self.drag_content_selection = true;
+                            }
+                        }
+                        HitTarget::CellSelect(index) => {
+                            self.last_click = Some((index, Instant::now()));
+                            self.selected = index;
+                            self.copy_target = CopyTarget::CellBody;
+                            self.clear_mouse_text_selection();
+                            self.load_selected_into_editor();
+                            self.ensure_selected_visible();
                         }
                         _ => self.activate_hit_target(target, mouse.column, mouse.row)?,
                     }
@@ -1195,6 +1194,10 @@ impl App {
                         .title(title),
                 );
             frame.render_widget(block, input_area);
+            self.hit_regions.push(HitRegion {
+                rect: input_area,
+                target: HitTarget::CellEditor(index),
+            });
             if content_area.width > 0 && content_area.height > 0 {
                 self.content_regions.push(ContentRegion {
                     rect: content_area,
@@ -2917,6 +2920,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.mode, AppMode::Command);
+        assert!(app.cell_mode(&app.notebook.cells[0]).body_collapsed);
+    }
+
+    #[test]
+    fn clicking_cell_select_only_selects_and_does_not_enter_edit_mode() {
+        let notebook = Notebook::new("Click").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.activate_hit_target(HitTarget::CellSelect(0), 0, 0).unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
+    }
+
+    #[test]
+    fn clicking_button_target_runs_action_instead_of_selection() {
+        let notebook = Notebook::new("Buttons").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.activate_hit_target(HitTarget::CellToggleBody(0), 0, 0).unwrap();
+
         assert!(app.cell_mode(&app.notebook.cells[0]).body_collapsed);
     }
 }
