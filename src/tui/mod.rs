@@ -1779,6 +1779,7 @@ impl App {
             self.status = "no cell selected".to_string();
             return;
         };
+        self.scroll_offset = self.cell_top_offset(selected);
         self.mode = AppMode::Edit;
         self.copy_target = CopyTarget::CellBody;
         self.clear_mouse_text_selection();
@@ -2509,6 +2510,12 @@ impl App {
             .sum()
     }
 
+    fn cell_top_offset(&self, index: usize) -> u16 {
+        (0..index)
+            .map(|idx| self.cell_height(idx).saturating_add(1))
+            .fold(0u16, |acc, height| acc.saturating_add(height))
+    }
+
     fn scroll_rows(&mut self, delta: isize) {
         let max_offset = self
             .total_notebook_height()
@@ -2536,10 +2543,7 @@ impl App {
         let Some(selected) = self.selected else {
             return;
         };
-        let mut cell_top = 0u16;
-        for index in 0..selected {
-            cell_top = cell_top.saturating_add(self.cell_height(index).saturating_add(1));
-        }
+        let cell_top = self.cell_top_offset(selected);
         let cell_bottom = cell_top.saturating_add(self.cell_height(selected).saturating_add(1));
         let viewport_top = self.scroll_offset;
         let viewport_bottom = viewport_top.saturating_add(self.notebook_area.height.max(1));
@@ -4021,6 +4025,33 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "d" && cell.fg != ratatui::style::Color::Reset)
         );
+    }
+
+    #[test]
+    fn entering_edit_mode_from_scrolled_cell_reveals_real_editor() {
+        let source = (0..20)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook = Notebook::new("EditScroll").with_cells(vec![
+            Cell::markdown("top"),
+            Cell::code(Language::Python, source),
+        ]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        app.notebook_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        app.selected = Some(1);
+        app.scroll_offset = 5;
+
+        app.enter_edit_mode();
+
+        assert_eq!(app.mode, AppMode::Edit);
+        assert_eq!(app.scroll_offset, app.cell_top_offset(1));
     }
 
     #[test]
