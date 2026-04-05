@@ -8,6 +8,9 @@ Current product slice:
 - explicit `.ipynb <-> .smd` conversion commands
 - a vertical notebook UI with selection-first interaction
 - mouse support for selecting cells, toolbar actions, scrolling, and editor cursor placement
+- notebook-wide kernel and environment selection in the toolbar
+- filename fallback for untitled notebooks in the UI
+- image-aware outputs with openable image placeholders
 - plugin-backed themes with declarative TOML theme specs
 - tree-sitter syntax highlighting for Python, Bash, JavaScript, and TypeScript
 - Python LSP activation for Basedpyright / Pyright-compatible servers when available
@@ -107,6 +110,8 @@ Toolbar actions:
 - `[Save]`
 - `[Run All]`
 - `[Restart]`
+- `[Kernel: ...]`
+- `[Env: ...]`
 - `[+ Code]`
 - `[+ Markdown]`
 
@@ -121,12 +126,15 @@ Keyboard flow:
 
 - `j` / `k`: move selection
 - `e` or `Enter`: edit selected cell
+- `K`: cycle notebook kernel
+- `E`: cycle environment
 - `r`: run selected executable cell
 - `R`: run all executable cells
 - `c`: insert a Python code cell below
 - `m`: insert a Markdown cell below
 - `d` or `Delete`: delete selected cell
 - `o`: collapse or expand selected cell output
+- `x`: open the selected cell's first image output externally
 - `Ctrl-S`: save notebook and checkpoint
 - `q`: quit
 
@@ -134,10 +142,46 @@ Mouse flow:
 
 - click a cell to select it
 - double click a cell body to edit it
-- click cell buttons for edit/render, run, insert, delete, and output toggle
+- click cell buttons for edit/render, run, insert, delete, output toggle, and image open
 - use the scroll wheel to move through notebook cells
 - click inside the editor to place the cursor
 - drag inside the editor to select text
+
+## Notebook Title
+
+If a notebook is still using the default untitled metadata, Strata shows the file stem in the toolbar instead.
+
+That is a display-only fallback. The stored notebook metadata is not silently rewritten.
+
+## Kernel And Environment
+
+Strata now treats the notebook UI as notebook-wide-kernel oriented.
+
+Kernel choices:
+
+- Python
+- Bash
+- JavaScript
+
+Environment choices:
+
+- `None`
+- `System`
+- discovered Python environments when the active kernel is Python
+
+Python environment discovery includes:
+
+- the active `VIRTUAL_ENV`
+- the active `CONDA_PREFIX`
+- notebook-local `.venv`, `venv`, and `env`
+
+Behavior:
+
+- `None` disables code-cell execution for the selected kernel
+- `System` uses the default runtime on `PATH`
+- discovered Python environments launch the Python kernel with that interpreter
+
+Legacy notebooks without explicit runtime metadata still run in compatibility mode if they contain older mixed-language cells.
 
 ## Scrolling And Bounds
 
@@ -275,6 +319,28 @@ Checkpoint state includes:
 
 Opening an existing notebook rehydrates language runtime state by replaying prior successful code-cell executions.
 
+## Image Outputs
+
+Strata now recognizes image-style outputs in two ways:
+
+- structured notebook outputs such as `display_data` / `execute_result` with image mime types
+- focused command/path detection for shell-style output like `display path/to/image.png` or direct image file paths
+
+Current behavior:
+
+- image outputs render as labeled placeholders in the notebook output area
+- clicking `[Open]` or pressing `x` opens the first image output for the selected cell with the system default opener
+- `.smd` saves materialize imported image payloads into `.strata/<notebook>/artifacts/` and store references instead of embedding large binaries into the notebook source
+
+Supported mime/path families:
+
+- `image/png`
+- `image/jpeg`
+- `image/svg+xml`
+- `image/gif` as external-open fallback
+
+Terminal-native inline image rendering is not the primary path yet. The current shipped behavior is artifact-backed image placeholders plus native system opening.
+
 ## Current Scope
 
 Included now:
@@ -282,8 +348,10 @@ Included now:
 - `.smd` notebook storage
 - `.ipynb` import and export
 - notebook-style TUI with selection-first interaction
+- notebook-wide kernel/environment controls
 - markdown cells without run controls
 - safer scrolling and viewport clamping
+- image-aware output placeholders and external open actions
 - plugin-backed theme loading with a built-in fallback theme
 - tree-sitter syntax highlighting
 - Python LSP activation path
@@ -310,6 +378,8 @@ That suite covers:
 - runtime hydration
 - `.smd` notebook execution
 - import/export conversion commands
+- notebook title fallback and runtime metadata round-trips
+- environment discovery and legacy-kernel compatibility behavior
 - theme plugin discovery and fallback handling
 - AI provider integration mocks
 - tree-sitter highlighter scaffolding
