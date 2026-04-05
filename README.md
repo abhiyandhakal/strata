@@ -1,81 +1,87 @@
 # Strata
 
-Strata is a terminal-native, structured execution environment for stateful notebooks in the CLI.
+Strata is now being reshaped into a terminal-native notebook that deliberately follows the Jupyter notebook model and interaction style.
 
-This repository now contains a much larger product slice of the architecture:
+Current product slice:
 
-- Markdown-backed notebooks with text, code, and AI cells
-- Checkpoint sidecar storage for resumable session metadata, execution history, AI history, and named values
-- Managed worker-backed kernels for Bash, Python, JavaScript, and TypeScript
-- Real AI provider integration for OpenAI Responses API and Anthropic Messages API
-- `models.dev` model catalog integration for provider/model lookup
-- A keyboard-first `ratatui` notebook editor with inline execution
-- A CLI execution path that runs notebooks and persists checkpoints
+- `.ipynb`-first notebook storage with nbformat-style cells and outputs
+- Python-first notebook execution with inline execution counts and output blocks
+- A vertical notebook TUI instead of the older split-pane editor
+- Mouse support for toolbar actions, cell focus, per-cell buttons, scrolling, and editor cursor placement
+- Tree-sitter-backed syntax highlighting for Python, Bash, JavaScript, and TypeScript
+- Python LSP activation path for Basedpyright / Pyright-style servers when available
+- Checkpoint sidecars for resumable runtime state and notebook UI state
 
 ## Run
 
-```bash
-cargo run
-```
-
-Or open a notebook:
+Open the notebook UI:
 
 ```bash
-cargo run -- open path/to/notebook.md
+cargo run -- open path/to/notebook.ipynb
 ```
 
-Run a notebook end-to-end:
+Run a notebook headlessly:
 
 ```bash
-cargo run -- run path/to/notebook.md
+cargo run -- run path/to/notebook.ipynb
 ```
 
-## AI setup
+If no path is provided, Strata opens an in-memory demo notebook.
 
-Strata loads AI provider credentials from environment variables.
+## Notebook Format
 
-OpenAI:
+Strata now treats `.ipynb` as the primary notebook format.
 
-```bash
-export OPENAI_API_KEY=...
-export STRATA_AI_PROVIDER=openai
-# optional
-export STRATA_AI_MODEL=...
-```
+Supported visible cell types:
 
-Anthropic:
+- `code`
+- `markdown`
+- `raw`
 
-```bash
-export ANTHROPIC_API_KEY=...
-export STRATA_AI_PROVIDER=anthropic
-# optional
-export STRATA_AI_MODEL=...
-```
+Code-cell execution results are written back into the notebook as:
 
-If `STRATA_AI_PROVIDER` is unset, Strata picks the first configured provider. If `STRATA_AI_MODEL` is unset, Strata resolves a text-capable model from the live `models.dev` catalog.
+- `execution_count`
+- structured outputs
+- error output blocks
 
-## TUI workflow
+Markdown-backed Strata notebooks still load for compatibility, but the notebook redesign is centered on `.ipynb`.
 
-When opening a notebook in a real terminal, Strata launches the TUI. Current key workflow:
+## TUI Workflow
 
-- `j` / `k`: move between cells
-- `v`: toggle vim mode for the current TUI session
-- `e`: edit selected cell
-- `Esc`: leave edit mode and keep changes in memory
-- `Ctrl-S`: save the notebook and checkpoint
-- `Ctrl-R`: run the current cell while editing
-- `r`: run the selected cell in normal mode
-- `b` / `p` / `J` / `t` / `a` / `n`: insert Bash, Python, JavaScript, TypeScript, AI, or text cells
-- `x`: delete the selected cell
+When launched in a real terminal, Strata opens a notebook-style document view:
+
+- top toolbar with save, run-all, restart, and insert-cell actions
+- vertically stacked cells
+- per-cell chrome with run / render / insert / delete / output toggle controls
+- inline outputs directly below each code cell
+
+Keyboard flow:
+
+- `j` / `k`: move cell focus
+- `e` or `Enter`: edit focused cell
+- `r`: run focused cell
+- `R`: run all executable cells
+- `c`: insert a Python code cell below
+- `m`: insert a Markdown cell below
+- `d` or `Delete`: delete focused cell
+- `o`: collapse or expand focused cell output
+- `Ctrl-S`: save notebook and checkpoint
 - `q`: quit
 
-The right pane shows the latest output or error for the selected cell, including AI responses and provider/model metadata when available.
+Mouse flow:
 
-## Vim mode
+- click a cell to select it
+- click cell toolbar buttons to run, toggle render, insert, delete, or collapse output
+- click toolbar buttons for save, run-all, restart, and insert-cell actions
+- use the scroll wheel to move through the notebook
+- click inside the editor to position the cursor
+- drag in the editor to select text
 
-Strata now supports an opt-in vim editor mode for the cell editor only. Notebook navigation outside editing keeps the regular Strata keymap.
+## Editing and Vim Mode
 
-Default configuration can come from TOML:
+The document UI still supports the existing editor-mode vim toggle.
+
+Config:
 
 ```toml
 # ~/.config/strata/config.toml
@@ -83,32 +89,91 @@ Default configuration can come from TOML:
 vim_mode = true
 ```
 
-Override config file discovery if needed:
+Environment overrides:
 
 ```bash
 export STRATA_CONFIG_PATH=/path/to/config.toml
-```
-
-Override vim mode directly from the environment:
-
-```bash
 export STRATA_VIM_MODE=1
 ```
 
-When vim mode is enabled and you press `e`, the editor starts in vim `NORMAL` mode. Key behavior:
+With vim mode enabled, entering edit mode starts the cell editor in vim `NORMAL`.
 
-- `i`, `a`, `A`, `I`, `o`, `O`: enter insert mode
-- `Esc`: return to vim `NORMAL`; pressing `Esc` again in vim `NORMAL` exits editor mode back to notebook mode
-- `h`, `j`, `k`, `l`, `w`, `b`, `e`, `0`, `^`, `$`: movement
-- `v`, `V`: visual selection
-- `x`, `dd`, `yy`, `p`, `u`, `Ctrl-R`: common editing operations
+## Syntax Highlighting
 
-Notebook-level `q`, `r`, insert-cell shortcuts, and save/run bindings remain outside the vim editor scope.
+Syntax highlighting is now driven by tree-sitter grammars for:
 
-## Resume behavior
+- Python
+- Bash
+- JavaScript
+- TypeScript
 
-Strata stores checkpoints under `.strata/<notebook-stem>/`. On reopen or `run`, it reloads the checkpoint and rehydrates runtime state by replaying previously successful code-cell executions into the managed kernels. Named values and AI history are restored from the checkpoint manifest.
+Markdown cells render as formatted notebook content when not editing and switch back to plain text while editing.
 
-## Current scope
+## Python LSP
 
-The runtime now executes real child-process workers, supports cross-language named-value handoff, provides real remote AI calls, and restores kernel state on resume by replaying prior successful cells. The next major gaps are richer editor ergonomics, AI patch/apply workflows, plugin support, dependency-aware execution, remote execution targets, and agent workflows.
+Strata now detects and attempts to activate a Python language server for the notebook UI.
+
+Discovery order:
+
+1. `basedpyright-langserver`
+2. `basedpyright`
+3. `pyright-langserver`
+4. `npx --yes basedpyright-langserver --stdio`
+
+The toolbar reports whether Python LSP is available or active. The current code activates the server process and performs the LSP initialize handshake so the UI can build on a real server connection.
+
+## Runtime and Checkpoints
+
+Strata keeps runtime state in a sidecar checkpoint directory:
+
+```text
+.strata/<notebook-stem>/session.json
+```
+
+Checkpoint state currently includes:
+
+- named values and execution history
+- AI history
+- next execution counter
+- notebook UI state such as selected cell, viewport, and rendered/collapsed cell modes
+
+Opening an existing notebook rehydrates language runtime state by replaying prior successful code-cell executions.
+
+## Current Scope
+
+This redesign is intentionally Jupyter-shaped first.
+
+Included now:
+
+- `.ipynb` model and persistence
+- notebook-style TUI
+- inline outputs and execution counts
+- mouse-driven notebook interactions
+- tree-sitter syntax highlighting
+- Python LSP activation path
+
+Still incomplete:
+
+- full Jupyter shortcut parity
+- rich MIME output rendering beyond text-first terminal fallbacks
+- notebook-wide drag-reorder via mouse
+- surfaced LSP UX like completion popups, hover panes, rename, references, and code actions
+- full removal of older Strata-specific AI and multi-language notebook assumptions from every internal layer
+
+## Verification
+
+Current verification commands:
+
+```bash
+cargo test --quiet
+```
+
+That suite covers:
+
+- Markdown and `.ipynb` storage round-trips
+- checkpoint persistence
+- runtime hydration
+- CLI notebook execution
+- AI provider integration mocks
+- tree-sitter highlighter scaffolding
+- notebook TUI editing and execution flows
