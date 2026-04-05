@@ -1,0 +1,7 @@
+id = "nocturne"
+name = "Nocturne"
+version = "0.1.0"
+capabilities = ["theme"]
+
+[theme]
+spec = "theme.toml"

@@ -1,0 +1,50 @@
+name = "Nocturne"
+
+[styles]
+"text.default" = { fg = "white" }
+"status.title" = { fg = "lightcyan", modifiers = ["bold"] }
+"status.body" = { fg = "gray" }
+"toolbar.block" = { fg = "white", bg = "#08111c" }
+"toolbar.border" = { fg = "lightblue", modifiers = ["bold"] }
+"toolbar.button.save" = { fg = "yellow", modifiers = ["bold"] }
+"toolbar.button.run_all" = { fg = "lightgreen", modifiers = ["bold"] }
+"toolbar.button.restart" = { fg = "lightred", modifiers = ["bold"] }
+"toolbar.button.add_code" = { fg = "cyan", modifiers = ["bold"] }
+"toolbar.button.add_markdown" = { fg = "lightmagenta", modifiers = ["bold"] }
+"notebook.empty" = { fg = "gray" }
+"cell.shell" = { fg = "white", bg = "#0d1724" }
+"cell.shell.selected" = { fg = "white", bg = "#14283a" }
+"cell.border" = { fg = "blue" }
+"cell.border.selected" = { fg = "lightcyan", modifiers = ["bold"] }
+"cell.prompt" = { fg = "gray" }
+"cell.prompt.selected" = { fg = "black", bg = "lightcyan", modifiers = ["bold"] }
+"cell.button.run" = { fg = "lightgreen", modifiers = ["bold"] }
+"cell.button.edit" = { fg = "yellow", modifiers = ["bold"] }
+"cell.button.add" = { fg = "cyan", modifiers = ["bold"] }
+"cell.button.delete" = { fg = "lightred", modifiers = ["bold"] }
+"cell.button.output" = { fg = "lightblue", modifiers = ["bold"] }
+"cell.title" = { fg = "white", modifiers = ["bold"] }
+"editor.cursor_line" = { modifiers = ["reversed"] }
+"editor.cursor.normal" = { modifiers = ["reversed"] }
+"editor.cursor.insert" = { fg = "lightblue", modifiers = ["reversed"] }
+"editor.cursor.visual" = { fg = "lightyellow", modifiers = ["reversed"] }
+"editor.cursor.operator" = { fg = "lightgreen", modifiers = ["reversed"] }
+"markdown.heading1" = { fg = "lightyellow", modifiers = ["bold"] }
+"markdown.heading2" = { fg = "lightcyan", modifiers = ["bold"] }
+"output.block" = { fg = "white", bg = "#08111c" }
+"output.border" = { fg = "blue" }
+"output.stream.label" = { fg = "lightblue", modifiers = ["bold"] }
+"output.result.label" = { fg = "lightgreen", modifiers = ["bold"] }
+"output.error.label" = { fg = "lightred", modifiers = ["bold"] }
+"output.error.trace" = { fg = "lightred" }
+"lsp.active" = { fg = "lightgreen", modifiers = ["bold"] }
+"lsp.available" = { fg = "lightcyan", modifiers = ["bold"] }
+"lsp.unavailable" = { fg = "yellow" }
+
+[syntax]
+comment = { fg = "darkgray" }
+string = { fg = "lightgreen" }
+number = { fg = "cyan" }
+type_name = { fg = "lightyellow" }
+keyword = { fg = "lightmagenta", modifiers = ["bold"] }
+identifier = { fg = "lightblue" }

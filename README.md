@@ -8,6 +8,7 @@ Current product slice:
 - explicit `.ipynb <-> .smd` conversion commands
 - a vertical notebook UI with selection-first interaction
 - mouse support for selecting cells, toolbar actions, scrolling, and editor cursor placement
+- plugin-backed themes with declarative TOML theme specs
 - tree-sitter syntax highlighting for Python, Bash, JavaScript, and TypeScript
 - Python LSP activation for Basedpyright / Pyright-compatible servers when available
 - checkpoint sidecars for runtime and notebook UI state
@@ -169,6 +170,70 @@ export STRATA_VIM_MODE=1
 
 When vim mode is enabled, entering edit mode starts the cell editor in vim `NORMAL`.
 
+## Themes
+
+Strata now has a theme plugin system.
+
+Theme selection is config-only in the current version:
+
+```toml
+[theme]
+path = "nocturne"
+```
+
+Theme lookup behavior:
+
+- relative theme paths resolve from the opened notebook directory
+- notebook-local theme plugins are discovered under `<notebook-dir>/.strata/plugins/`
+- user-level theme plugins are discovered under `~/.config/strata/plugins/`
+- if the configured theme is missing or invalid, Strata falls back to the built-in default theme and shows a startup warning in the status area
+
+Theme plugin layout:
+
+```text
+my-theme/
+  plugin.toml
+  theme.toml
+```
+
+Example `plugin.toml`:
+
+```toml
+id = "nocturne"
+name = "Nocturne"
+version = "0.1.0"
+capabilities = ["theme"]
+
+[theme]
+spec = "theme.toml"
+```
+
+`theme.toml` is declarative. It maps semantic UI component keys to styles plus syntax token colors.
+
+Example:
+
+```toml
+[styles]
+"toolbar.block" = { fg = "white", bg = "#08111c" }
+"cell.border.selected" = { fg = "lightcyan", modifiers = ["bold"] }
+"cell.button.run" = { fg = "lightgreen", modifiers = ["bold"] }
+"markdown.heading1" = { fg = "lightyellow", modifiers = ["bold"] }
+
+[syntax]
+keyword = { fg = "lightmagenta", modifiers = ["bold"] }
+string = { fg = "lightgreen" }
+identifier = { fg = "lightblue" }
+```
+
+An example theme plugin is included in [examples/theme-plugins/nocturne](examples/theme-plugins/nocturne). Copy it into either `~/.config/strata/plugins/nocturne/` or `<notebook-dir>/.strata/plugins/nocturne/`, then set:
+
+```toml
+[theme]
+path = "nocturne"
+```
+
+The first version of theming supports declarative full-surface skinning for the existing UI, but not executable theme hooks or layout replacement.
+
 ## Syntax Highlighting
 
 Syntax highlighting is powered by tree-sitter grammars for:
@@ -219,6 +284,7 @@ Included now:
 - notebook-style TUI with selection-first interaction
 - markdown cells without run controls
 - safer scrolling and viewport clamping
+- plugin-backed theme loading with a built-in fallback theme
 - tree-sitter syntax highlighting
 - Python LSP activation path
 
@@ -244,6 +310,7 @@ That suite covers:
 - runtime hydration
 - `.smd` notebook execution
 - import/export conversion commands
+- theme plugin discovery and fallback handling
 - AI provider integration mocks
 - tree-sitter highlighter scaffolding
 - notebook TUI editing, selection, and scrolling behavior
