@@ -14,7 +14,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -460,6 +460,7 @@ pub struct App {
     notebook_area: Rect,
     last_click: Option<(usize, Instant)>,
     theme: Theme,
+    editor_row_offset: usize,
 }
 
 impl App {
@@ -509,6 +510,7 @@ impl App {
             notebook_area: Rect::default(),
             last_click: None,
             theme,
+            editor_row_offset: 0,
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
@@ -941,9 +943,13 @@ impl App {
 
         if selected && self.mode == AppMode::Edit && (!rendered || cell.kind == CellKind::Code) {
             self.sync_editor_presentation();
-            self.editor
-                .set_block(Block::default().title(title).borders(Borders::ALL));
-            frame.render_widget(&self.editor, input_area);
+            if cell.kind == CellKind::Code {
+                self.render_code_editor(frame, input_area, inner_input, &title, cell);
+            } else {
+                self.editor
+                    .set_block(Block::default().title(title).borders(Borders::ALL));
+                frame.render_widget(&self.editor, input_area);
+            }
             self.active_editor_rect = Some(inner_input);
             self.hit_regions.push(HitRegion { rect: input_area, target: HitTarget::CellEditor(index) });
         } else {
@@ -1013,6 +1019,7 @@ impl App {
         if self.mode == AppMode::Edit && self.vim_enabled {
             self.vim = Some(VimState::new(VimMode::Normal));
         }
+        self.sync_editor_row_offset(usize::MAX);
         self.sync_editor_presentation();
     }
 
@@ -1287,7 +1294,9 @@ impl App {
     }
 
     fn place_editor_cursor(&mut self, column: u16, row: u16, rect: Rect, selecting: bool) {
-        let local_row = row.saturating_sub(rect.y);
+        let local_row = row
+            .saturating_sub(rect.y)
+            .saturating_add(self.editor_row_offset as u16);
         let local_col = column.saturating_sub(rect.x);
         if selecting && !self.editor.is_selecting() {
             self.editor.start_selection();
@@ -1295,6 +1304,7 @@ impl App {
             self.editor.cancel_selection();
         }
         self.editor.move_cursor(CursorMove::Jump(local_row, local_col));
+        self.sync_editor_row_offset(rect.height as usize);
         self.sync_editor_presentation();
     }
 
@@ -1366,6 +1376,79 @@ impl App {
             cell.source.lines().count().max(1)
         };
         (lines as u16).min(10) + 2
+    }
+
+    fn sync_editor_row_offset(&mut self, visible_height: usize) {
+        let (cursor_row, _) = self.editor.cursor();
+        if visible_height == usize::MAX || visible_height == 0 {
+            self.editor_row_offset = 0;
+            return;
+        }
+        if cursor_row < self.editor_row_offset {
+            self.editor_row_offset = cursor_row;
+            return;
+        }
+        let last_visible = self.editor_row_offset.saturating_add(visible_height.saturating_sub(1));
+        if cursor_row > last_visible {
+            self.editor_row_offset = cursor_row.saturating_sub(visible_height.saturating_sub(1));
+        }
+    }
+
+    fn render_code_editor(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        inner: Rect,
+        title: &str,
+        cell: &Cell,
+    ) {
+        let block = Block::default()
+            .title(title.to_string())
+            .borders(Borders::ALL)
+            .border_style(self.theme.style("cell.border.selected"))
+            .style(self.theme.style("cell.shell.selected"));
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        self.sync_editor_row_offset(inner.height as usize);
+        let selection_style = self.editor.selection_style();
+        let lines = self.editor.lines().to_vec();
+        let highlighted = SyntaxHighlighter::highlight_with_theme(cell.language, &lines.join("\n"), &self.theme);
+        let cursor = self.editor.cursor();
+        let selection = self.editor.selection_range();
+
+        let start = self.editor_row_offset;
+        let end = usize::min(start + inner.height as usize, lines.len().max(1));
+        let mut rendered = Vec::new();
+        for line_index in start..end {
+            let raw_line = lines.get(line_index).map(String::as_str).unwrap_or("");
+            let highlighted_line = highlighted.lines.get(line_index);
+            rendered.push(render_editor_line(
+                raw_line,
+                highlighted_line,
+                line_index,
+                cursor.0,
+                selection,
+                self.theme.style("editor.cursor_line"),
+                selection_style,
+            ));
+        }
+        if rendered.is_empty() {
+            rendered.push(Line::from(String::new()));
+        }
+        frame.render_widget(Paragraph::new(Text::from(rendered)), inner);
+
+        let cursor_screen_row = cursor.0.saturating_sub(self.editor_row_offset);
+        if cursor_screen_row < inner.height as usize {
+            let cursor_x = inner.x.saturating_add(cursor.1 as u16);
+            let max_x = inner.x.saturating_add(inner.width.saturating_sub(1));
+            frame.set_cursor_position(Position::new(
+                cursor_x.min(max_x),
+                inner.y.saturating_add(cursor_screen_row as u16),
+            ));
+        }
     }
 
     fn output_height(&self, cell: &Cell) -> u16 {
@@ -1469,6 +1552,86 @@ fn render_markdown_block(source: &str, theme: &Theme) -> Text<'static> {
         lines.push(Line::from(String::new()));
     }
     Text::from(lines)
+}
+
+fn render_editor_line(
+    raw_line: &str,
+    highlighted_line: Option<&Line<'static>>,
+    line_index: usize,
+    cursor_row: usize,
+    selection: Option<((usize, usize), (usize, usize))>,
+    cursor_line_style: Style,
+    selection_style: Style,
+) -> Line<'static> {
+    let mut chars = flatten_highlighted_line(raw_line, highlighted_line);
+
+    if line_index == cursor_row {
+        for (_, style) in &mut chars {
+            *style = style.patch(cursor_line_style);
+        }
+    }
+
+    if let Some(((start_row, start_col), (end_row, end_col))) = selection {
+        let selection_start = if line_index == start_row { start_col } else { 0 };
+        let selection_end = if line_index == end_row {
+            end_col
+        } else if start_row <= line_index && line_index < end_row {
+            chars.len()
+        } else {
+            0
+        };
+        if start_row <= line_index && line_index <= end_row {
+            for (index, (_, style)) in chars.iter_mut().enumerate() {
+                if index >= selection_start && index < selection_end {
+                    *style = style.patch(selection_style);
+                }
+            }
+        }
+    }
+
+    merge_styled_chars(chars)
+}
+
+fn flatten_highlighted_line(
+    raw_line: &str,
+    highlighted_line: Option<&Line<'static>>,
+) -> Vec<(String, Style)> {
+    if let Some(line) = highlighted_line {
+        let mut chars = Vec::new();
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                chars.push((ch.to_string(), span.style));
+            }
+        }
+        if !chars.is_empty() {
+            return chars;
+        }
+    }
+    raw_line
+        .chars()
+        .map(|ch| (ch.to_string(), Style::default()))
+        .collect()
+}
+
+fn merge_styled_chars(chars: Vec<(String, Style)>) -> Line<'static> {
+    if chars.is_empty() {
+        return Line::from(String::new());
+    }
+    let mut spans = Vec::new();
+    let mut current_style = chars[0].1;
+    let mut current_text = String::new();
+
+    for (text, style) in chars {
+        if style == current_style {
+            current_text.push_str(&text);
+        } else {
+            spans.push(Span::styled(current_text, current_style));
+            current_text = text;
+            current_style = style;
+        }
+    }
+    spans.push(Span::styled(current_text, current_style));
+    Line::from(spans)
 }
 
 fn render_code_block(cell: &Cell, theme: &Theme) -> Text<'static> {
@@ -1688,5 +1851,29 @@ mod tests {
 
         assert_eq!(app.selected, 5);
         assert!(app.scroll_offset > 0);
+    }
+
+    #[test]
+    fn editor_line_renderer_preserves_highlighted_content() {
+        let theme = Theme::default_theme();
+        let highlighted = SyntaxHighlighter::highlight_with_theme(
+            Language::Python,
+            "def make_blobs(x):",
+            &theme,
+        );
+
+        let line = render_editor_line(
+            "def make_blobs(x):",
+            highlighted.lines.first(),
+            0,
+            0,
+            None,
+            theme.style("editor.cursor_line"),
+            theme.style("cell.prompt.selected"),
+        );
+        let rendered = format!("{line:?}");
+
+        assert!(rendered.contains("def"));
+        assert!(rendered.contains("make_blobs"));
     }
 }
