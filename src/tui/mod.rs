@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{
@@ -432,6 +432,7 @@ enum HitTarget {
     CellSelect(usize),
     CellEditor(usize),
     CellRun(usize),
+    CellEdit(usize),
     CellToggleRender(usize),
     CellToggleOutput(usize),
     CellInsertBelow(usize),
@@ -456,6 +457,8 @@ pub struct App {
     drag_selection: bool,
     python_lsp: PythonLspStatus,
     python_lsp_client: Option<PythonLspClient>,
+    notebook_area: Rect,
+    last_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -500,6 +503,8 @@ impl App {
             drag_selection: false,
             python_lsp: PythonLspStatus::detect(),
             python_lsp_client: None,
+            notebook_area: Rect::default(),
+            last_click: None,
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
@@ -551,8 +556,8 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.save_all()?
             }
-            KeyCode::PageDown => self.scroll_offset = self.scroll_offset.saturating_add(5),
-            KeyCode::PageUp => self.scroll_offset = self.scroll_offset.saturating_sub(5),
+            KeyCode::PageDown => self.scroll_cells(1),
+            KeyCode::PageUp => self.scroll_cells(-1),
             _ => {}
         }
 
@@ -619,17 +624,51 @@ impl App {
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_add(2);
+                self.scroll_cells(1);
                 return Ok(());
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(2);
+                self.scroll_cells(-1);
                 return Ok(());
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(target) = self.hit_test(mouse.column, mouse.row) {
-                    self.drag_selection = matches!(target, HitTarget::CellEditor(index) if index == self.selected && self.mode == AppMode::Edit);
-                    self.activate_hit_target(target, mouse.column, mouse.row)?;
+                    match target.clone() {
+                        HitTarget::CellEditor(index)
+                            if index == self.selected && self.mode == AppMode::Edit =>
+                        {
+                            self.drag_selection = true;
+                            self.activate_hit_target(target, mouse.column, mouse.row)?;
+                        }
+                        HitTarget::CellSelect(index) | HitTarget::CellEditor(index) => {
+                            let is_double_click = self
+                                .last_click
+                                .as_ref()
+                                .map(|(last_index, last_time)| {
+                                    *last_index == index
+                                        && last_time.elapsed() <= Duration::from_millis(350)
+                                })
+                                .unwrap_or(false);
+                            self.last_click = Some((index, Instant::now()));
+                            self.selected = index;
+                            self.load_selected_into_editor();
+                            self.ensure_selected_visible();
+                            if is_double_click {
+                                self.enter_edit_mode();
+                                if matches!(target, HitTarget::CellEditor(_)) {
+                                    if let Some(rect) = self.active_editor_rect {
+                                        self.place_editor_cursor(
+                                            mouse.column,
+                                            mouse.row,
+                                            rect,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => self.activate_hit_target(target, mouse.column, mouse.row)?,
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.drag_selection => {
@@ -680,6 +719,8 @@ impl App {
             .split(frame.area());
 
         self.draw_toolbar(frame, chunks[0]);
+        self.notebook_area = chunks[1];
+        self.clamp_scroll_offset();
         self.draw_notebook(frame, chunks[1]);
         let status = Paragraph::new(self.status.as_str())
             .wrap(Wrap { trim: false })
@@ -752,21 +793,29 @@ impl App {
             return;
         }
 
-        let mut cursor_y = area.y as i32 - self.scroll_offset as i32;
-        for index in 0..self.notebook.cells.len() {
+        let mut cursor_y = area.y;
+        let start = usize::min(self.scroll_offset as usize, self.notebook.cells.len().saturating_sub(1));
+        for index in start..self.notebook.cells.len() {
             let cell = self.notebook.cells[index].clone();
-            let height = self.cell_height(index);
+            let remaining = area
+                .y
+                .saturating_add(area.height)
+                .saturating_sub(cursor_y);
+            if remaining < 4 {
+                break;
+            }
+            let height = self.cell_height(index).min(remaining);
             let cell_area = Rect {
                 x: area.x,
-                y: cursor_y.max(area.y as i32) as u16,
+                y: cursor_y,
                 width: area.width,
                 height,
             };
-            let cell_bottom = cursor_y + height as i32;
-            if cell_bottom > area.y as i32 && cursor_y < (area.y + area.height) as i32 {
-                self.draw_cell(frame, area, cell_area, index, &cell);
+            self.draw_cell(frame, area, cell_area, index, &cell);
+            cursor_y = cursor_y.saturating_add(height.saturating_add(1));
+            if cursor_y >= area.y.saturating_add(area.height) {
+                break;
             }
-            cursor_y += height as i32 + 1;
         }
     }
 
@@ -779,11 +828,31 @@ impl App {
         cell: &Cell,
     ) {
         let selected = index == self.selected;
-        let chrome_style = if selected {
+        let shell_style = if selected {
+            Style::default().bg(Color::Rgb(20, 34, 46))
+        } else {
+            Style::default().bg(Color::Rgb(10, 14, 20))
+        };
+        let border_style = if selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightCyan)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .style(shell_style),
+            area,
+        );
+        let inner = shrink(area, 1);
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+        let chrome_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::LightCyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -794,39 +863,46 @@ impl App {
             CellKind::Ai => "[AI]".to_string(),
         };
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
-        let chrome = Line::from(vec![
-            Span::styled(prompt, chrome_style),
-            Span::raw(" "),
-            Span::styled("[Run]", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled(
-                if rendered { "[Edit]" } else { "[Render]" },
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(" "),
-            Span::styled("[+]", Style::default().fg(Color::Cyan)),
-            Span::raw(" "),
-            Span::styled("[Del]", Style::default().fg(Color::Red)),
-            Span::raw(" "),
-            Span::styled("[Out]", Style::default().fg(Color::Blue)),
-        ]);
+        let mut chrome_spans = vec![Span::styled(prompt, chrome_style), Span::raw(" ")];
+        if is_executable(cell) {
+            chrome_spans.push(Span::styled("[Run]", Style::default().fg(Color::Green)));
+            chrome_spans.push(Span::raw(" "));
+        }
+        chrome_spans.push(Span::styled(
+            match cell.kind {
+                CellKind::Markdown => {
+                    if rendered { "[Edit]" } else { "[Render]" }
+                }
+                _ => "[Edit]",
+            },
+            Style::default().fg(Color::Yellow),
+        ));
+        chrome_spans.push(Span::raw(" "));
+        chrome_spans.push(Span::styled("[+]", Style::default().fg(Color::Cyan)));
+        chrome_spans.push(Span::raw(" "));
+        chrome_spans.push(Span::styled("[Del]", Style::default().fg(Color::Red)));
+        if !cell.outputs.is_empty() {
+            chrome_spans.push(Span::raw(" "));
+            chrome_spans.push(Span::styled("[Out]", Style::default().fg(Color::Blue)));
+        }
+        let chrome = Line::from(chrome_spans);
         let chrome_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
             height: 1,
         };
         frame.render_widget(Paragraph::new(chrome), chrome_area);
-        self.register_cell_chrome_hits(chrome_area, index, rendered);
+        self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
         self.hit_regions.push(HitRegion {
-            rect: chrome_area,
+            rect: area,
             target: HitTarget::CellSelect(index),
         });
 
         let input_area = Rect {
-            x: area.x,
-            y: area.y + 1,
-            width: area.width,
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
             height: self.input_height(cell, index),
         };
         let inner_input = shrink(input_area, 1);
@@ -849,10 +925,7 @@ impl App {
                 .set_block(Block::default().title(title).borders(Borders::ALL));
             frame.render_widget(&self.editor, input_area);
             self.active_editor_rect = Some(inner_input);
-            self.hit_regions.push(HitRegion {
-                rect: inner_input,
-                target: HitTarget::CellEditor(index),
-            });
+            self.hit_regions.push(HitRegion { rect: input_area, target: HitTarget::CellEditor(index) });
         } else {
             let content = match cell.kind {
                 CellKind::Markdown if rendered => render_markdown_block(&cell.source),
@@ -864,16 +937,13 @@ impl App {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(if selected {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default()
-                        })
+                        .border_style(border_style)
+                        .style(shell_style)
                         .title(title),
                 );
             frame.render_widget(block, input_area);
             self.hit_regions.push(HitRegion {
-                rect: input_area,
+                rect: area,
                 target: HitTarget::CellSelect(index),
             });
         }
@@ -881,21 +951,17 @@ impl App {
         let output_collapsed = self.cell_mode(cell).output_collapsed;
         if !cell.outputs.is_empty() && !output_collapsed {
             let output_area = Rect {
-                x: area.x + 3,
-                y: area.y + 1 + input_area.height,
-                width: area.width.saturating_sub(3),
-                height: self.output_height(cell),
+                x: inner.x + 2,
+                y: inner.y + 1 + input_area.height,
+                width: inner.width.saturating_sub(2),
+                height: self.output_height(cell).min(inner.height.saturating_sub(1 + input_area.height)),
             };
             let output = Paragraph::new(render_output_block(cell))
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title("Output"));
-            if output_area.y < viewport.y + viewport.height {
+            if output_area.height > 0 && output_area.y < viewport.y + viewport.height {
                 frame.render_widget(output, output_area);
             }
-        }
-
-        if selected && area.y + area.height > viewport.y + viewport.height {
-            self.scroll_offset = self.scroll_offset.saturating_add(2);
         }
     }
 
@@ -907,6 +973,7 @@ impl App {
         let next = (self.selected as isize + delta).clamp(0, max_index) as usize;
         self.selected = next;
         self.load_selected_into_editor();
+        self.ensure_selected_visible();
     }
 
     fn load_selected_into_editor(&mut self) {
@@ -1148,6 +1215,7 @@ impl App {
             HitTarget::CellSelect(index) => {
                 self.selected = index;
                 self.load_selected_into_editor();
+                self.ensure_selected_visible();
             }
             HitTarget::CellEditor(index) => {
                 self.selected = index;
@@ -1159,6 +1227,10 @@ impl App {
             HitTarget::CellRun(index) => {
                 self.selected = index;
                 self.run_selected_cell()?;
+            }
+            HitTarget::CellEdit(index) => {
+                self.selected = index;
+                self.enter_edit_mode();
             }
             HitTarget::CellToggleRender(index) => {
                 self.selected = index;
@@ -1199,18 +1271,31 @@ impl App {
         self.sync_editor_presentation();
     }
 
-    fn register_cell_chrome_hits(&mut self, chrome_area: Rect, index: usize, rendered: bool) {
-        let labels = [
-            ("[Run]", HitTarget::CellRun(index)),
-            (
-                if rendered { "[Edit]" } else { "[Render]" },
-                HitTarget::CellToggleRender(index),
-            ),
-            ("[+]", HitTarget::CellInsertBelow(index)),
-            ("[Del]", HitTarget::CellDelete(index)),
-            ("[Out]", HitTarget::CellToggleOutput(index)),
-        ];
-        let mut x = chrome_area.x + 11;
+    fn register_cell_chrome_hits(&mut self, chrome_area: Rect, index: usize, cell: &Cell, rendered: bool) {
+        let mut labels = Vec::new();
+        if is_executable(cell) {
+            labels.push(("[Run]", HitTarget::CellRun(index)));
+        }
+        labels.push((
+            match cell.kind {
+                CellKind::Markdown => {
+                    if rendered { "[Edit]" } else { "[Render]" }
+                }
+                _ => "[Edit]",
+            },
+            if cell.kind == CellKind::Markdown {
+                HitTarget::CellToggleRender(index)
+            } else {
+                HitTarget::CellEdit(index)
+            },
+        ));
+        labels.push(("[+]", HitTarget::CellInsertBelow(index)));
+        labels.push(("[Del]", HitTarget::CellDelete(index)));
+        if !cell.outputs.is_empty() {
+            labels.push(("[Out]", HitTarget::CellToggleOutput(index)));
+        }
+
+        let mut x = chrome_area.x + prompt_width(cell);
         for (label, target) in labels {
             self.hit_regions.push(HitRegion {
                 rect: Rect {
@@ -1227,7 +1312,7 @@ impl App {
             rect: Rect {
                 x: chrome_area.x,
                 y: chrome_area.y,
-                width: 10,
+                width: prompt_width(cell).saturating_sub(1),
                 height: 1,
             },
             target: HitTarget::CellSelect(index),
@@ -1244,7 +1329,7 @@ impl App {
         } else {
             0
         };
-        1 + input + output
+        2 + 1 + input + output
     }
 
     fn input_height(&self, cell: &Cell, index: usize) -> u16 {
@@ -1259,6 +1344,43 @@ impl App {
     fn output_height(&self, cell: &Cell) -> u16 {
         let lines = render_output_block(cell).lines.len().max(1);
         (lines as u16).min(8) + 2
+    }
+
+    fn scroll_cells(&mut self, delta: isize) {
+        if self.notebook.cells.is_empty() {
+            return;
+        }
+        let max_index = self.notebook.cells.len().saturating_sub(1) as isize;
+        let next = (self.scroll_offset as isize + delta).clamp(0, max_index) as u16;
+        self.scroll_offset = next;
+    }
+
+    fn clamp_scroll_offset(&mut self) {
+        if self.notebook.cells.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        let max = self.notebook.cells.len().saturating_sub(1) as u16;
+        self.scroll_offset = self.scroll_offset.min(max);
+    }
+
+    fn ensure_selected_visible(&mut self) {
+        self.clamp_scroll_offset();
+        let top = self.scroll_offset as usize;
+        if self.selected < top {
+            self.scroll_offset = self.selected as u16;
+            return;
+        }
+        let mut cursor_y = self.notebook_area.y;
+        let bottom = self.notebook_area.y.saturating_add(self.notebook_area.height);
+        for index in top..=self.selected {
+            let height = self.cell_height(index).saturating_add(1);
+            if cursor_y.saturating_add(height) > bottom {
+                self.scroll_offset = self.selected as u16;
+                break;
+            }
+            cursor_y = cursor_y.saturating_add(height);
+        }
     }
 }
 
@@ -1384,6 +1506,24 @@ fn contains(rect: Rect, column: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
+fn is_executable(cell: &Cell) -> bool {
+    matches!(cell.kind, CellKind::Code | CellKind::Ai)
+}
+
+fn prompt_width(cell: &Cell) -> u16 {
+    let prompt = match cell.kind {
+        CellKind::Code => format!(
+            "In [{}]:",
+            cell.execution_count
+                .map_or(" ".to_string(), |n| n.to_string())
+        ),
+        CellKind::Markdown => "[Markdown]".to_string(),
+        CellKind::Raw => "[Raw]".to_string(),
+        CellKind::Ai => "[AI]".to_string(),
+    };
+    prompt.len() as u16 + 2
+}
+
 fn shrink(rect: Rect, amount: u16) -> Rect {
     Rect {
         x: rect.x.saturating_add(amount),
@@ -1424,7 +1564,7 @@ mod tests {
     #[test]
     fn app_save_writes_ipynb_file() {
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("demo.ipynb");
+        let path = temp.path().join("demo.smd");
         let notebook = Notebook::new("Save").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, Some(path.clone()), session, false);
@@ -1432,8 +1572,8 @@ mod tests {
         app.save_all().unwrap();
 
         let saved = std::fs::read_to_string(path).unwrap();
-        assert!(saved.contains("\"nbformat\""));
-        assert!(saved.contains("\"title\": \"Save\""));
+        assert!(saved.contains("strata:format"));
+        assert!(saved.contains("title=\"Save\""));
     }
 
     #[test]
@@ -1473,5 +1613,37 @@ mod tests {
 
         assert_eq!(app.notebook.cells.len(), 2);
         assert_eq!(app.notebook.cells[1].kind, CellKind::Markdown);
+    }
+
+    #[test]
+    fn markdown_cells_are_not_executable() {
+        let notebook = Notebook::new("Doc").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false);
+
+        let result = app.run_selected_cell();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn selection_scrolls_to_keep_selected_cell_visible() {
+        let cells = (0..8)
+            .map(|i| Cell::markdown(format!("cell {i}")))
+            .collect::<Vec<_>>();
+        let notebook = Notebook::new("Scroll").with_cells(cells);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false);
+        app.notebook_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+
+        app.move_selection(5);
+
+        assert_eq!(app.selected, 5);
+        assert!(app.scroll_offset > 0);
     }
 }
