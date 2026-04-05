@@ -1782,7 +1782,7 @@ impl App {
         } else {
             cell.source.lines().count().max(1)
         };
-        (lines as u16).min(10) + 2
+        (lines as u16) + 2
     }
 
     fn sync_editor_row_offset(&mut self, visible_height: usize) {
@@ -2875,6 +2875,19 @@ mod tests {
 
         assert!(collapsed < expanded);
         assert!(!app.cell_mode(&app.notebook.cells[0]).body_collapsed);
+    }
+
+    #[test]
+    fn input_height_does_not_clip_long_cell_source() {
+        let source = (0..24)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook = Notebook::new("Long").with_cells(vec![Cell::code(Language::Python, source)]);
+        let session = SessionManager::new(&notebook);
+        let app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        assert_eq!(app.input_height(&app.notebook.cells[0], 0), 26);
     }
 
     #[test]
