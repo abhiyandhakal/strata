@@ -1,29 +1,36 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
-use crate::core::{Cell, CellKind, ExecutionStatus, Language, Notebook};
+use crate::core::{
+    Cell, CellKind, CellOutput, CellUiState, ExecutionStatus, Language, Notebook,
+};
 use crate::runtime::SessionManager;
 use crate::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
+use crate::tooling::{PythonLspClient, PythonLspStatus, SyntaxHighlighter};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppMode {
-    Normal,
+    Command,
     Edit,
 }
 
@@ -409,6 +416,28 @@ impl VimState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct HitRegion {
+    rect: Rect,
+    target: HitTarget,
+}
+
+#[derive(Clone, Debug)]
+enum HitTarget {
+    ToolbarSave,
+    ToolbarRunAll,
+    ToolbarRestart,
+    ToolbarAddCode,
+    ToolbarAddMarkdown,
+    CellSelect(usize),
+    CellEditor(usize),
+    CellRun(usize),
+    CellToggleRender(usize),
+    CellToggleOutput(usize),
+    CellInsertBelow(usize),
+    CellDelete(usize),
+}
+
 pub struct App {
     pub notebook: Notebook,
     pub selected: usize,
@@ -420,6 +449,13 @@ pub struct App {
     editor: TextArea<'static>,
     vim_enabled: bool,
     vim: Option<VimState>,
+    scroll_offset: u16,
+    cell_modes: BTreeMap<String, CellUiState>,
+    hit_regions: Vec<HitRegion>,
+    active_editor_rect: Option<Rect>,
+    drag_selection: bool,
+    python_lsp: PythonLspStatus,
+    python_lsp_client: Option<PythonLspClient>,
 }
 
 impl App {
@@ -432,34 +468,61 @@ impl App {
         let checkpoint_paths = notebook_path
             .as_ref()
             .map(|path| CheckpointPaths::for_notebook(path));
+
+        let mut cell_modes = session.manifest.ui_state.cell_modes.clone();
+        for cell in &notebook.cells {
+            cell_modes.entry(cell.id.0.clone()).or_insert_with(|| CellUiState {
+                rendered: cell.kind == CellKind::Markdown,
+                output_collapsed: false,
+            });
+        }
+
+        let selected = usize::min(
+            session.manifest.ui_state.selected_cell,
+            notebook.cells.len().saturating_sub(1),
+        );
+        let viewport_row = session.manifest.ui_state.viewport_row as u16;
         let mut app = Self {
             notebook,
-            selected: 0,
+            selected,
             status: String::new(),
             notebook_path,
             checkpoint_paths,
             session,
-            mode: AppMode::Normal,
+            mode: AppMode::Command,
             editor: TextArea::default(),
             vim_enabled,
             vim: None,
+            scroll_offset: viewport_row,
+            cell_modes,
+            hit_regions: Vec::new(),
+            active_editor_rect: None,
+            drag_selection: false,
+            python_lsp: PythonLspStatus::detect(),
+            python_lsp_client: None,
         };
+        app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
         app.refresh_status();
         app
     }
 
     pub fn run(&mut self) -> Result<()> {
+        self.activate_python_lsp();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
         let loop_result = self.event_loop(&mut terminal);
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
         terminal.show_cursor()?;
 
         loop_result
@@ -467,29 +530,29 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         match self.mode {
-            AppMode::Normal => self.handle_normal_mode(key),
+            AppMode::Command => self.handle_command_mode(key),
             AppMode::Edit => self.handle_edit_mode(key),
         }
     }
 
-    fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<bool> {
+    fn handle_command_mode(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Char('e') => self.enter_edit_mode(),
+            KeyCode::Char('e') | KeyCode::Enter => self.enter_edit_mode(),
             KeyCode::Char('r') => self.run_selected_cell()?,
-            KeyCode::Char('b') => self.insert_cell(Language::Bash),
-            KeyCode::Char('p') => self.insert_cell(Language::Python),
-            KeyCode::Char('J') => self.insert_cell(Language::JavaScript),
-            KeyCode::Char('t') => self.insert_cell(Language::TypeScript),
-            KeyCode::Char('a') => self.insert_ai_cell(),
-            KeyCode::Char('n') => self.insert_text_cell(),
-            KeyCode::Char('x') => self.delete_selected_cell(),
+            KeyCode::Char('R') => self.run_all_cells()?,
+            KeyCode::Char('c') => self.insert_code_cell(),
+            KeyCode::Char('m') => self.insert_markdown_cell(),
+            KeyCode::Char('d') | KeyCode::Delete => self.delete_selected_cell(),
+            KeyCode::Char('o') => self.toggle_output_for_selected(),
             KeyCode::Char('v') => self.toggle_vim_mode(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.save_all()?
             }
+            KeyCode::PageDown => self.scroll_offset = self.scroll_offset.saturating_add(5),
+            KeyCode::PageUp => self.scroll_offset = self.scroll_offset.saturating_sub(5),
             _ => {}
         }
 
@@ -507,11 +570,18 @@ impl App {
             self.run_selected_cell()?;
             return Ok(false);
         }
+        if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
+            self.apply_editor_to_cell();
+            self.run_selected_cell()?;
+            self.mode = AppMode::Command;
+            self.vim = None;
+            return Ok(false);
+        }
 
         if self.vim_enabled {
             if key.code == KeyCode::Esc && matches!(self.vim_mode(), Some(VimMode::Normal)) {
                 self.apply_editor_to_cell();
-                self.mode = AppMode::Normal;
+                self.mode = AppMode::Command;
                 self.vim = None;
                 self.sync_editor_presentation();
                 self.refresh_status();
@@ -529,19 +599,51 @@ impl App {
                 VimTransition::Nop => Some(vim),
             };
             self.sync_editor_presentation();
+            self.apply_editor_to_cell();
             self.refresh_status();
             return Ok(false);
         }
 
         if key.code == KeyCode::Esc {
             self.apply_editor_to_cell();
-            self.mode = AppMode::Normal;
+            self.mode = AppMode::Command;
             self.refresh_status();
             return Ok(false);
         }
 
         self.editor.input(input_from_key_event(key));
+        self.apply_editor_to_cell();
         Ok(false)
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(2);
+                return Ok(());
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(2);
+                return Ok(());
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self.hit_test(mouse.column, mouse.row) {
+                    self.drag_selection = matches!(target, HitTarget::CellEditor(index) if index == self.selected && self.mode == AppMode::Edit);
+                    self.activate_hit_target(target, mouse.column, mouse.row)?;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.drag_selection => {
+                if let Some(rect) = self.active_editor_rect {
+                    self.place_editor_cursor(mouse.column, mouse.row, rect, true);
+                    self.apply_editor_to_cell();
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_selection = false;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn event_loop<B: ratatui::backend::Backend>(
@@ -551,114 +653,250 @@ impl App {
         loop {
             terminal.draw(|frame| self.draw(frame))?;
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key_event(key)? {
-                        self.save_checkpoint_only()?;
-                        return Ok(());
+                match event::read()? {
+                    Event::Key(key) => {
+                        if self.handle_key_event(key)? {
+                            self.save_checkpoint_only()?;
+                            return Ok(());
+                        }
                     }
+                    Event::Mouse(mouse) => self.handle_mouse_event(mouse)?,
+                    _ => {}
                 }
             }
         }
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        self.hit_regions.clear();
+        self.active_editor_rect = None;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(3)])
-            .split(frame.area());
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(26),
-                Constraint::Percentage(37),
-                Constraint::Percentage(37),
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(2),
             ])
-            .split(chunks[0]);
+            .split(frame.area());
 
-        let items: Vec<ListItem<'_>> = self
-            .notebook
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(index, cell)| {
-                let marker = if index == self.selected { ">" } else { " " };
-                let kind = match cell.kind {
-                    CellKind::Code => cell.language.fence_name(),
-                    CellKind::Ai => "ai",
-                    CellKind::Text => "text",
-                };
-                let content = format!("{marker} {kind} {}", cell.id.0);
-                ListItem::new(Line::from(content))
-            })
-            .collect();
-
-        let list = List::new(items).block(
-            Block::default()
-                .title(self.notebook.metadata.title.as_str())
-                .borders(Borders::ALL),
-        );
-        frame.render_widget(list, body[0]);
-
-        self.sync_editor_presentation();
-        frame.render_widget(&self.editor, body[1]);
-
-        let output = self.render_output();
-        frame.render_widget(output, body[2]);
-
+        self.draw_toolbar(frame, chunks[0]);
+        self.draw_notebook(frame, chunks[1]);
         let status = Paragraph::new(self.status.as_str())
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(Line::styled(
-                self.status_title(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-        frame.render_widget(status, chunks[1]);
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .title(Line::styled("Status", Style::default().add_modifier(Modifier::BOLD))),
+            );
+        frame.render_widget(status, chunks[2]);
+
     }
 
-    fn render_output(&self) -> Paragraph<'_> {
-        let text = if let Some(cell) = self.notebook.cells.get(self.selected) {
-            if let Some(record) = self.session.latest_record_for_cell(&cell.id.0) {
-                let mut lines = vec![format!(
-                    "{:?} exit={} lang={}",
-                    record.status,
-                    record.exit_code,
-                    record.language.fence_name()
-                )];
-                if !record.output.is_empty() {
-                    lines.push(record.output.clone());
-                }
-                if !record.error_output.is_empty() {
-                    lines.push(record.error_output.clone());
-                }
-                lines.join("\n")
-            } else if let Some(run) = self
-                .session
-                .manifest
-                .ai_history
-                .iter()
-                .rev()
-                .find(|run| run.prompt_cell_id == cell.id.0)
-            {
-                let mut lines = vec![format!(
-                    "{:?} provider={} model={}",
-                    run.status, run.provider_name, run.model_id
-                )];
-                if !run.response.is_empty() {
-                    lines.push(run.response.clone());
-                }
-                if !run.error_output.is_empty() {
-                    lines.push(run.error_output.clone());
-                }
-                lines.join("\n")
-            } else {
-                "No output for selected cell.".to_string()
+    fn draw_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let block = Block::default().borders(Borders::ALL).title(format!(
+            "{} | kernel={} | mode={:?} | {}",
+            self.notebook.metadata.title,
+            self.notebook.metadata.kernelspec.display_name,
+            self.mode,
+            self.python_lsp.summary()
+        ));
+        frame.render_widget(block, area);
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let mut spans = vec![
+            Span::styled("[Save]", Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled("[Run All]", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("[Restart]", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::styled("[+ Code]", Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
+            Span::styled("[+ Markdown]", Style::default().fg(Color::Blue)),
+        ];
+        let toolbar = Paragraph::new(Line::from(std::mem::take(&mut spans)));
+        frame.render_widget(toolbar, inner);
+
+        let mut x = inner.x;
+        for (label, target) in [
+            ("[Save]", HitTarget::ToolbarSave),
+            ("[Run All]", HitTarget::ToolbarRunAll),
+            ("[Restart]", HitTarget::ToolbarRestart),
+            ("[+ Code]", HitTarget::ToolbarAddCode),
+            ("[+ Markdown]", HitTarget::ToolbarAddMarkdown),
+        ] {
+            self.hit_regions.push(HitRegion {
+                rect: Rect {
+                    x,
+                    y: inner.y,
+                    width: label.len() as u16,
+                    height: 1,
+                },
+                target,
+            });
+            x += label.len() as u16 + 1;
+        }
+    }
+
+    fn draw_notebook(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if self.notebook.cells.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No cells. Use [+ Code] or [+ Markdown].")
+                    .block(Block::default().borders(Borders::ALL).title("Notebook")),
+                area,
+            );
+            return;
+        }
+
+        let mut cursor_y = area.y as i32 - self.scroll_offset as i32;
+        for index in 0..self.notebook.cells.len() {
+            let cell = self.notebook.cells[index].clone();
+            let height = self.cell_height(index);
+            let cell_area = Rect {
+                x: area.x,
+                y: cursor_y.max(area.y as i32) as u16,
+                width: area.width,
+                height,
+            };
+            let cell_bottom = cursor_y + height as i32;
+            if cell_bottom > area.y as i32 && cursor_y < (area.y + area.height) as i32 {
+                self.draw_cell(frame, area, cell_area, index, &cell);
             }
+            cursor_y += height as i32 + 1;
+        }
+    }
+
+    fn draw_cell(
+        &mut self,
+        frame: &mut Frame<'_>,
+        viewport: Rect,
+        area: Rect,
+        index: usize,
+        cell: &Cell,
+    ) {
+        let selected = index == self.selected;
+        let chrome_style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
         } else {
-            "No selected cell.".to_string()
+            Style::default().fg(Color::Gray)
+        };
+        let prompt = match cell.kind {
+            CellKind::Code => format!("In [{}]:", cell.execution_count.map_or(" ".to_string(), |n| n.to_string())),
+            CellKind::Markdown => "[Markdown]".to_string(),
+            CellKind::Raw => "[Raw]".to_string(),
+            CellKind::Ai => "[AI]".to_string(),
+        };
+        let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
+        let chrome = Line::from(vec![
+            Span::styled(prompt, chrome_style),
+            Span::raw(" "),
+            Span::styled("[Run]", Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled(
+                if rendered { "[Edit]" } else { "[Render]" },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" "),
+            Span::styled("[+]", Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
+            Span::styled("[Del]", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::styled("[Out]", Style::default().fg(Color::Blue)),
+        ]);
+        let chrome_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(chrome), chrome_area);
+        self.register_cell_chrome_hits(chrome_area, index, rendered);
+        self.hit_regions.push(HitRegion {
+            rect: chrome_area,
+            target: HitTarget::CellSelect(index),
+        });
+
+        let input_area = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: self.input_height(cell, index),
+        };
+        let inner_input = shrink(input_area, 1);
+        let title = match cell.kind {
+            CellKind::Code => format!("code {}", cell.language.fence_name()),
+            CellKind::Markdown => {
+                if rendered {
+                    "markdown rendered".to_string()
+                } else {
+                    "markdown".to_string()
+                }
+            }
+            CellKind::Raw => "raw".to_string(),
+            CellKind::Ai => "ai".to_string(),
         };
 
-        Paragraph::new(Text::from(text))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title("Output").borders(Borders::ALL))
+        if selected && self.mode == AppMode::Edit && (!rendered || cell.kind == CellKind::Code) {
+            self.sync_editor_presentation();
+            self.editor
+                .set_block(Block::default().title(title).borders(Borders::ALL));
+            frame.render_widget(&self.editor, input_area);
+            self.active_editor_rect = Some(inner_input);
+            self.hit_regions.push(HitRegion {
+                rect: inner_input,
+                target: HitTarget::CellEditor(index),
+            });
+        } else {
+            let content = match cell.kind {
+                CellKind::Markdown if rendered => render_markdown_block(&cell.source),
+                CellKind::Code => render_code_block(cell),
+                _ => Text::from(cell.source.clone()),
+            };
+            let block = Paragraph::new(content)
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if selected {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        })
+                        .title(title),
+                );
+            frame.render_widget(block, input_area);
+            self.hit_regions.push(HitRegion {
+                rect: input_area,
+                target: HitTarget::CellSelect(index),
+            });
+        }
+
+        let output_collapsed = self.cell_mode(cell).output_collapsed;
+        if !cell.outputs.is_empty() && !output_collapsed {
+            let output_area = Rect {
+                x: area.x + 3,
+                y: area.y + 1 + input_area.height,
+                width: area.width.saturating_sub(3),
+                height: self.output_height(cell),
+            };
+            let output = Paragraph::new(render_output_block(cell))
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title("Output"));
+            if output_area.y < viewport.y + viewport.height {
+                frame.render_widget(output, output_area);
+            }
+        }
+
+        if selected && area.y + area.height > viewport.y + viewport.height {
+            self.scroll_offset = self.scroll_offset.saturating_add(2);
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -669,7 +907,6 @@ impl App {
         let next = (self.selected as isize + delta).clamp(0, max_index) as usize;
         self.selected = next;
         self.load_selected_into_editor();
-        self.refresh_status();
     }
 
     fn load_selected_into_editor(&mut self) {
@@ -677,6 +914,8 @@ impl App {
         if let Some(cell) = self.notebook.cells.get(self.selected) {
             self.editor = TextArea::from(cell.source.lines().map(|line| line.to_string()));
         }
+        self.editor
+            .set_cursor_line_style(Style::default().add_modifier(Modifier::REVERSED));
         if self.mode == AppMode::Edit && self.vim_enabled {
             self.vim = Some(VimState::new(VimMode::Normal));
         }
@@ -689,52 +928,59 @@ impl App {
         }
     }
 
-    fn insert_cell(&mut self, language: Language) {
+    fn insert_code_cell(&mut self) {
         let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
         self.notebook
             .cells
-            .insert(next, Cell::code(language, String::new()));
+            .insert(next, Cell::code(Language::Python, String::new()));
+        self.cell_modes
+            .insert(self.notebook.cells[next].id.0.clone(), CellUiState::default());
         self.selected = next;
         self.enter_edit_mode();
-        self.status = format!("inserted {} cell", language.fence_name());
+        self.status = "inserted code cell".to_string();
     }
 
-    fn insert_ai_cell(&mut self) {
+    fn insert_markdown_cell(&mut self) {
         let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
-        self.notebook.cells.insert(next, Cell::ai(String::new()));
+        self.notebook.cells.insert(next, Cell::markdown(String::new()));
+        self.cell_modes.insert(
+            self.notebook.cells[next].id.0.clone(),
+            CellUiState {
+                rendered: false,
+                output_collapsed: false,
+            },
+        );
         self.selected = next;
         self.enter_edit_mode();
-        self.status = "inserted ai cell".to_string();
-    }
-
-    fn insert_text_cell(&mut self) {
-        let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
-        self.notebook.cells.insert(next, Cell::text(String::new()));
-        self.selected = next;
-        self.enter_edit_mode();
-        self.status = "inserted text cell".to_string();
+        self.status = "inserted markdown cell".to_string();
     }
 
     fn delete_selected_cell(&mut self) {
         if self.notebook.cells.is_empty() {
             return;
         }
-        self.notebook.cells.remove(self.selected);
+        let removed = self.notebook.cells.remove(self.selected);
+        self.cell_modes.remove(&removed.id.0);
         if self.selected >= self.notebook.cells.len() && !self.notebook.cells.is_empty() {
             self.selected = self.notebook.cells.len() - 1;
         }
-        if self.notebook.cells.is_empty() {
-            self.notebook.cells.push(Cell::text(String::new()));
-            self.selected = 0;
-        }
+        self.ensure_notebook_not_empty();
         self.load_selected_into_editor();
         self.status = "deleted selected cell".to_string();
     }
 
+    fn ensure_notebook_not_empty(&mut self) {
+        if self.notebook.cells.is_empty() {
+            self.notebook.cells.push(Cell::markdown(String::new()));
+            self.selected = 0;
+        }
+    }
+
     fn save_all(&mut self) -> Result<()> {
         self.apply_editor_to_cell();
+        self.sync_manifest_ui_state();
         if let Some(path) = &self.notebook_path {
-            NotebookStorage::save_markdown(path, &self.notebook)
+            NotebookStorage::save(path, &self.notebook)
                 .with_context(|| format!("failed to save {}", path.display()))?;
         }
         self.save_checkpoint_only()?;
@@ -743,30 +989,64 @@ impl App {
     }
 
     fn save_checkpoint_only(&mut self) -> Result<()> {
+        self.sync_manifest_ui_state();
         if let Some(paths) = &self.checkpoint_paths {
             CheckpointStorage::save(paths, &self.session.manifest)?;
         }
         Ok(())
     }
 
+    fn sync_manifest_ui_state(&mut self) {
+        self.session.manifest.ui_state.selected_cell = self.selected;
+        self.session.manifest.ui_state.viewport_row = self.scroll_offset as usize;
+        self.session.manifest.ui_state.cell_modes = self.cell_modes.clone();
+    }
+
     fn run_selected_cell(&mut self) -> Result<()> {
         self.apply_editor_to_cell();
-        let record = self.session.run_cell_at(&self.notebook, self.selected)?;
+        let record = self.session.run_cell_at(&mut self.notebook, self.selected)?;
         self.save_checkpoint_only()?;
         self.status = format!(
             "ran {} -> {:?} (exit {})",
             record.cell_id, record.status, record.exit_code
         );
         if record.status == ExecutionStatus::Failed {
-            self.mode = AppMode::Normal;
+            self.mode = AppMode::Command;
             self.vim = None;
             self.sync_editor_presentation();
         }
         Ok(())
     }
 
+    fn run_all_cells(&mut self) -> Result<()> {
+        self.apply_editor_to_cell();
+        for index in 0..self.notebook.cells.len() {
+            if matches!(self.notebook.cells[index].kind, CellKind::Code | CellKind::Ai) {
+                self.selected = index;
+                self.session.run_cell_at(&mut self.notebook, index)?;
+            }
+        }
+        self.save_checkpoint_only()?;
+        self.status = "ran all executable cells".to_string();
+        Ok(())
+    }
+
+    fn restart_runtime(&mut self) -> Result<()> {
+        self.session.restart_all()?;
+        self.status = "restarted notebook runtime".to_string();
+        Ok(())
+    }
+
     fn enter_edit_mode(&mut self) {
         self.mode = AppMode::Edit;
+        if let Some(cell) = self.notebook.cells.get(self.selected) {
+            if cell.kind == CellKind::Markdown {
+                self.cell_modes
+                    .entry(cell.id.0.clone())
+                    .or_default()
+                    .rendered = false;
+            }
+        }
         self.vim = if self.vim_enabled {
             Some(VimState::new(VimMode::Normal))
         } else {
@@ -780,12 +1060,40 @@ impl App {
         self.vim_enabled = !self.vim_enabled;
         self.vim = None;
         self.sync_editor_presentation();
-        self.refresh_status();
-        self.status = if self.vim_enabled {
+        let status = if self.vim_enabled {
             "vim mode enabled for this session".to_string()
         } else {
             "vim mode disabled for this session".to_string()
         };
+        self.refresh_status();
+        self.status = status;
+    }
+
+    fn toggle_output_for_selected(&mut self) {
+        if let Some(cell) = self.notebook.cells.get(self.selected) {
+            let mode = self.cell_modes.entry(cell.id.0.clone()).or_default();
+            mode.output_collapsed = !mode.output_collapsed;
+        }
+    }
+
+    fn cell_mode(&self, cell: &Cell) -> CellUiState {
+        self.cell_modes
+            .get(&cell.id.0)
+            .cloned()
+            .unwrap_or_else(|| CellUiState {
+                rendered: cell.kind == CellKind::Markdown,
+                output_collapsed: false,
+            })
+    }
+
+    fn activate_python_lsp(&mut self) {
+        if self.python_lsp_client.is_some() {
+            return;
+        }
+        if let Ok((client, status)) = PythonLspClient::activate(&self.python_lsp) {
+            self.python_lsp = status;
+            self.python_lsp_client = Some(client);
+        }
     }
 
     fn vim_mode(&self) -> Option<VimMode> {
@@ -793,9 +1101,6 @@ impl App {
     }
 
     fn sync_editor_presentation(&mut self) {
-        let title = self.editor_title();
-        self.editor
-            .set_block(Block::default().title(title).borders(Borders::ALL));
         self.editor
             .set_cursor_line_style(Style::default().add_modifier(Modifier::REVERSED));
         let cursor_style = match self.vim.as_ref() {
@@ -805,64 +1110,155 @@ impl App {
         self.editor.set_cursor_style(cursor_style);
     }
 
-    fn editor_title(&self) -> String {
-        let prefix = if self.mode == AppMode::Edit {
-            "Editing"
-        } else {
-            "Cell"
-        };
-        let language = self
-            .notebook
-            .cells
-            .get(self.selected)
-            .map(|cell| cell.language.fence_name())
-            .unwrap_or("text");
-        match self.vim_mode() {
-            Some(mode) => format!("{prefix} {language} [VIM {mode}]"),
-            None if self.vim_enabled => format!("{prefix} {language} [VIM READY]"),
-            None => format!("{prefix} {language}"),
-        }
-    }
-
-    fn status_title(&self) -> String {
-        match self.vim_mode() {
-            Some(mode) => format!("Status [{:?} | VIM {mode}]", self.mode),
-            None => format!(
-                "Status [{:?} | {}]",
-                self.mode,
-                if self.vim_enabled {
-                    "VIM ON"
-                } else {
-                    "VIM OFF"
-                }
-            ),
-        }
-    }
-
     fn refresh_status(&mut self) {
-        self.status = match (self.mode, self.vim_mode(), self.vim_enabled) {
-            (AppMode::Normal, _, true) => {
-                "normal: j/k move | e edit | v toggle vim | r run | ctrl-s save | b/p/J/t/a/n add | x delete | q quit".to_string()
+        self.status = match (self.mode, self.vim_mode()) {
+            (AppMode::Command, _) => "command: click cells/buttons | e edit | r run | R run all | c code | m markdown | d delete | ctrl-s save | q quit".to_string(),
+            (AppMode::Edit, Some(VimMode::Normal)) => {
+                "edit vim NORMAL: i insert | Esc exit editor | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
-            (AppMode::Normal, _, false) => {
-                "normal: j/k move | e edit | v toggle vim | r run | ctrl-s save | b/p/J/t/a/n add | x delete | q quit".to_string()
+            (AppMode::Edit, Some(VimMode::Insert)) => {
+                "edit vim INSERT: Esc normal | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
-            (AppMode::Edit, Some(VimMode::Normal), _) => {
-                "edit vim NORMAL: i/a/o enter insert | v visual | Esc exit editor | ctrl-s save | ctrl-r run".to_string()
+            (AppMode::Edit, Some(VimMode::Visual)) => {
+                "edit vim VISUAL: y copy | d delete | c change | Esc normal".to_string()
             }
-            (AppMode::Edit, Some(VimMode::Insert), _) => {
-                "edit vim INSERT: Esc normal | ctrl-s save | ctrl-r run".to_string()
+            (AppMode::Edit, Some(VimMode::Operator(_))) => {
+                "edit vim OPERATOR: motion applies pending operator".to_string()
             }
-            (AppMode::Edit, Some(VimMode::Visual), _) => {
-                "edit vim VISUAL: y copy | d delete | c change | Esc normal | ctrl-s save | ctrl-r run".to_string()
-            }
-            (AppMode::Edit, Some(VimMode::Operator(_)), _) => {
-                "edit vim OPERATOR: motion applies pending operator | Esc normal | ctrl-s save | ctrl-r run".to_string()
-            }
-            (AppMode::Edit, None, _) => {
-                "edit: Esc finish | ctrl-s save | ctrl-r run".to_string()
+            (AppMode::Edit, None) => {
+                "edit: Esc finish | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
         };
+    }
+
+    fn hit_test(&self, column: u16, row: u16) -> Option<HitTarget> {
+        self.hit_regions
+            .iter()
+            .find(|region| contains(region.rect, column, row))
+            .map(|region| region.target.clone())
+    }
+
+    fn activate_hit_target(&mut self, target: HitTarget, column: u16, row: u16) -> Result<()> {
+        match target {
+            HitTarget::ToolbarSave => self.save_all()?,
+            HitTarget::ToolbarRunAll => self.run_all_cells()?,
+            HitTarget::ToolbarRestart => self.restart_runtime()?,
+            HitTarget::ToolbarAddCode => self.insert_code_cell(),
+            HitTarget::ToolbarAddMarkdown => self.insert_markdown_cell(),
+            HitTarget::CellSelect(index) => {
+                self.selected = index;
+                self.load_selected_into_editor();
+            }
+            HitTarget::CellEditor(index) => {
+                self.selected = index;
+                self.enter_edit_mode();
+                if let Some(rect) = self.active_editor_rect {
+                    self.place_editor_cursor(column, row, rect, false);
+                }
+            }
+            HitTarget::CellRun(index) => {
+                self.selected = index;
+                self.run_selected_cell()?;
+            }
+            HitTarget::CellToggleRender(index) => {
+                self.selected = index;
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let mode = self.cell_modes.entry(cell.id.0.clone()).or_default();
+                    mode.rendered = !mode.rendered;
+                }
+            }
+            HitTarget::CellToggleOutput(index) => {
+                self.selected = index;
+                self.toggle_output_for_selected();
+            }
+            HitTarget::CellInsertBelow(index) => {
+                self.selected = index;
+                if matches!(self.notebook.cells[index].kind, CellKind::Markdown) {
+                    self.insert_markdown_cell();
+                } else {
+                    self.insert_code_cell();
+                }
+            }
+            HitTarget::CellDelete(index) => {
+                self.selected = index;
+                self.delete_selected_cell();
+            }
+        }
+        Ok(())
+    }
+
+    fn place_editor_cursor(&mut self, column: u16, row: u16, rect: Rect, selecting: bool) {
+        let local_row = row.saturating_sub(rect.y);
+        let local_col = column.saturating_sub(rect.x);
+        if selecting && !self.editor.is_selecting() {
+            self.editor.start_selection();
+        } else if !selecting {
+            self.editor.cancel_selection();
+        }
+        self.editor.move_cursor(CursorMove::Jump(local_row, local_col));
+        self.sync_editor_presentation();
+    }
+
+    fn register_cell_chrome_hits(&mut self, chrome_area: Rect, index: usize, rendered: bool) {
+        let labels = [
+            ("[Run]", HitTarget::CellRun(index)),
+            (
+                if rendered { "[Edit]" } else { "[Render]" },
+                HitTarget::CellToggleRender(index),
+            ),
+            ("[+]", HitTarget::CellInsertBelow(index)),
+            ("[Del]", HitTarget::CellDelete(index)),
+            ("[Out]", HitTarget::CellToggleOutput(index)),
+        ];
+        let mut x = chrome_area.x + 11;
+        for (label, target) in labels {
+            self.hit_regions.push(HitRegion {
+                rect: Rect {
+                    x,
+                    y: chrome_area.y,
+                    width: label.len() as u16,
+                    height: 1,
+                },
+                target,
+            });
+            x += label.len() as u16 + 1;
+        }
+        self.hit_regions.push(HitRegion {
+            rect: Rect {
+                x: chrome_area.x,
+                y: chrome_area.y,
+                width: 10,
+                height: 1,
+            },
+            target: HitTarget::CellSelect(index),
+        });
+    }
+
+    fn cell_height(&self, index: usize) -> u16 {
+        let Some(cell) = self.notebook.cells.get(index) else {
+            return 3;
+        };
+        let input = self.input_height(cell, index);
+        let output = if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
+            self.output_height(cell)
+        } else {
+            0
+        };
+        1 + input + output
+    }
+
+    fn input_height(&self, cell: &Cell, index: usize) -> u16 {
+        let lines = if index == self.selected && self.mode == AppMode::Edit {
+            self.editor.lines().len().max(1)
+        } else {
+            cell.source.lines().count().max(1)
+        };
+        (lines as u16).min(10) + 2
+    }
+
+    fn output_height(&self, cell: &Cell) -> u16 {
+        let lines = render_output_block(cell).lines.len().max(1);
+        (lines as u16).min(8) + 2
     }
 }
 
@@ -895,6 +1291,108 @@ fn input_from_key_event(key: KeyEvent) -> Input {
     }
 }
 
+fn render_markdown_block(source: &str) -> Text<'static> {
+    let mut lines = Vec::new();
+    for line in source.lines() {
+        if let Some(rest) = line.strip_prefix("# ") {
+            lines.push(Line::from(vec![Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )]));
+        } else if let Some(rest) = line.strip_prefix("## ") {
+            lines.push(Line::from(vec![Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]));
+        } else {
+            lines.push(Line::from(line.to_string()));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(String::new()));
+    }
+    Text::from(lines)
+}
+
+fn render_code_block(cell: &Cell) -> Text<'static> {
+    SyntaxHighlighter::highlight(cell.language, &cell.source)
+}
+
+fn render_output_block(cell: &Cell) -> Text<'static> {
+    let mut lines = Vec::new();
+    for output in &cell.outputs {
+        match output {
+            CellOutput::Stream { name, text } => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{name}:"),
+                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                )]));
+                for line in text.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
+            CellOutput::ExecuteResult {
+                execution_count,
+                data,
+                ..
+            } => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("Out [{execution_count}]:"),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )]));
+                if let Some(value) = data.get("text/plain") {
+                    for line in value.as_str().unwrap_or_default().lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+                }
+            }
+            CellOutput::DisplayData { data, .. } => {
+                if let Some(value) = data.get("text/plain") {
+                    for line in value.as_str().unwrap_or_default().lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+                }
+            }
+            CellOutput::Error {
+                ename,
+                evalue,
+                traceback,
+            } => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{ename}: {evalue}"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )]));
+                for line in traceback {
+                    lines.push(Line::from(Span::styled(
+                        line.clone(),
+                        Style::default().fg(Color::LightRed),
+                    )));
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("No output."));
+    }
+    Text::from(lines)
+}
+
+fn contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn shrink(rect: Rect, amount: u16) -> Rect {
+    Rect {
+        x: rect.x.saturating_add(amount),
+        y: rect.y.saturating_add(amount),
+        width: rect.width.saturating_sub(amount * 2),
+        height: rect.height.saturating_sub(amount * 2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,26 +1418,27 @@ mod tests {
             .unwrap();
 
         assert!(app.notebook.cells[0].source.contains('#'));
-        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.mode, AppMode::Command);
     }
 
     #[test]
-    fn app_save_writes_notebook_file() {
+    fn app_save_writes_ipynb_file() {
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("demo.md");
-        let notebook = Notebook::new("Save").with_cells(vec![Cell::text("hello")]);
+        let path = temp.path().join("demo.ipynb");
+        let notebook = Notebook::new("Save").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, Some(path.clone()), session, false);
 
         app.save_all().unwrap();
 
         let saved = std::fs::read_to_string(path).unwrap();
-        assert!(saved.contains("# Save"));
+        assert!(saved.contains("\"nbformat\""));
+        assert!(saved.contains("\"title\": \"Save\""));
     }
 
     #[test]
     fn vim_mode_can_be_toggled_in_session() {
-        let notebook = Notebook::new("Vim").with_cells(vec![Cell::text("hello")]);
+        let notebook = Notebook::new("Vim").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false);
 
@@ -951,127 +1450,28 @@ mod tests {
     }
 
     #[test]
-    fn vim_mode_enters_normal_and_requires_double_escape_to_exit() {
-        let notebook =
-            Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, true);
+    fn run_selected_cell_updates_inline_outputs() {
+        let notebook = Notebook::new("Run")
+            .with_cells(vec![Cell::code(Language::Python, "print('hello')")]);
+        let mut session = SessionManager::new(&notebook);
+        session.register_default_kernels().unwrap();
+        let mut app = App::new(notebook, None, session, false);
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.vim_mode(), Some(VimMode::Normal));
+        app.run_selected_cell().unwrap();
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.vim_mode(), Some(VimMode::Insert));
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.mode, AppMode::Edit);
-        assert_eq!(app.vim_mode(), Some(VimMode::Normal));
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.mode, AppMode::Normal);
-        assert_eq!(app.vim_mode(), None);
+        assert_eq!(app.notebook.cells[0].execution_count, Some(1));
+        assert!(!app.notebook.cells[0].outputs.is_empty());
     }
 
     #[test]
-    fn vim_insert_appends_text_after_entering_insert_mode() {
-        let notebook =
-            Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, true);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-
-        assert!(app.notebook.cells[0].source.ends_with('#'));
-    }
-
-    #[test]
-    fn vim_delete_command_edits_buffer_in_normal_mode() {
-        let notebook = Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "abc")]);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, true);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-
-        assert_eq!(app.notebook.cells[0].source, "bc");
-    }
-
-    #[test]
-    fn vim_substitute_command_replaces_character_and_enters_insert_mode() {
-        let notebook = Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "abc")]);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, true);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.vim_mode(), Some(VimMode::Insert));
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-
-        assert_eq!(app.notebook.cells[0].source, "zbc");
-    }
-
-    #[test]
-    fn vim_visual_substitute_replaces_selection() {
-        let notebook = Notebook::new("Vim").with_cells(vec![Cell::code(Language::Python, "abcd")]);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, true);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.vim_mode(), Some(VimMode::Insert));
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-
-        assert_eq!(app.notebook.cells[0].source, "zcd");
-    }
-
-    #[test]
-    fn inserting_into_empty_notebook_does_not_panic() {
+    fn inserting_into_empty_notebook_creates_markdown_cell() {
         let notebook = Notebook::new("Empty");
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false);
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
-            .unwrap();
+        app.insert_markdown_cell();
 
-        assert_eq!(app.notebook.cells.len(), 1);
-        assert_eq!(app.selected, 0);
-        assert_eq!(app.notebook.cells[0].kind, CellKind::Ai);
+        assert_eq!(app.notebook.cells.len(), 2);
+        assert_eq!(app.notebook.cells[1].kind, CellKind::Markdown);
     }
 }

@@ -1,9 +1,15 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
-use crate::core::{Cell, CellId, CellKind, Language, Notebook, NotebookMetadata, SessionManifest};
+use crate::core::{
+    Cell, CellId, CellKind, CellOutput, Kernelspec, Language, LanguageInfo, Notebook,
+    NotebookMetadata, SessionManifest,
+};
 
 #[derive(Clone, Debug)]
 pub struct CheckpointPaths {
@@ -34,6 +40,183 @@ impl CheckpointPaths {
 pub struct NotebookStorage;
 
 impl NotebookStorage {
+    pub fn load(path: &Path) -> Result<Notebook> {
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("ipynb") => Self::load_ipynb(path),
+            _ => Self::load_markdown(path),
+        }
+    }
+
+    pub fn save(path: &Path, notebook: &Notebook) -> Result<()> {
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("ipynb") => Self::save_ipynb(path, notebook),
+            _ => Self::save_markdown(path, notebook),
+        }
+    }
+
+    pub fn render(path: Option<&Path>, notebook: &Notebook) -> String {
+        match path.and_then(|value| value.extension().and_then(|ext| ext.to_str())) {
+            Some("ipynb") => Self::render_ipynb(notebook),
+            _ => Self::render_markdown(notebook),
+        }
+    }
+
+    pub fn load_ipynb(path: &Path) -> Result<Notebook> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read notebook at {}", path.display()))?;
+        Self::parse_ipynb(&raw)
+    }
+
+    pub fn save_ipynb(path: &Path, notebook: &Notebook) -> Result<()> {
+        let rendered = Self::render_ipynb(notebook);
+        fs::write(path, rendered)
+            .with_context(|| format!("failed to write notebook at {}", path.display()))
+    }
+
+    pub fn parse_ipynb(raw: &str) -> Result<Notebook> {
+        let parsed: IpynbNotebook = serde_json::from_str(raw).context("invalid ipynb notebook")?;
+        let mut metadata = NotebookMetadata::default();
+        metadata.kernelspec = parsed
+            .metadata
+            .kernelspec
+            .unwrap_or_else(Kernelspec::default);
+        metadata.language_info = parsed
+            .metadata
+            .language_info
+            .unwrap_or_else(LanguageInfo::default);
+        metadata.extra = parsed.metadata.extra;
+        if let Some(strata) = parsed.metadata.strata {
+            if let Some(title) = strata.title {
+                metadata.title = title;
+            }
+            metadata.description = strata.description;
+        }
+
+        let cells = parsed
+            .cells
+            .into_iter()
+            .map(|cell| match cell {
+                IpynbCell::Markdown {
+                    id,
+                    source,
+                    metadata,
+                    attachments,
+                } => {
+                    let mut cell_metadata = metadata;
+                    if !attachments.is_empty() {
+                        cell_metadata.insert("attachments".to_string(), Value::Object(attachments));
+                    }
+                    Ok(Cell {
+                        id: CellId(id.unwrap_or_else(|| CellId::new().0)),
+                        kind: CellKind::Markdown,
+                        language: Language::Text,
+                        source: source.join(),
+                        execution_count: None,
+                        outputs: Vec::new(),
+                        metadata: cell_metadata,
+                    })
+                }
+                IpynbCell::Raw {
+                    id,
+                    source,
+                    metadata,
+                    attachments,
+                } => {
+                    let mut cell_metadata = metadata;
+                    if !attachments.is_empty() {
+                        cell_metadata.insert("attachments".to_string(), Value::Object(attachments));
+                    }
+                    Ok(Cell {
+                        id: CellId(id.unwrap_or_else(|| CellId::new().0)),
+                        kind: CellKind::Raw,
+                        language: Language::Text,
+                        source: source.join(),
+                        execution_count: None,
+                        outputs: Vec::new(),
+                        metadata: cell_metadata,
+                    })
+                }
+                IpynbCell::Code {
+                    id,
+                    source,
+                    metadata,
+                    execution_count,
+                    outputs,
+                } => Ok(Cell {
+                    id: CellId(id.unwrap_or_else(|| CellId::new().0)),
+                    kind: CellKind::Code,
+                    language: Language::Python,
+                    source: source.join(),
+                    execution_count,
+                    outputs,
+                    metadata,
+                }),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Notebook {
+            metadata,
+            nbformat: parsed.nbformat,
+            nbformat_minor: parsed.nbformat_minor,
+            cells,
+        })
+    }
+
+    pub fn render_ipynb(notebook: &Notebook) -> String {
+        let strata = json!({
+            "title": notebook.metadata.title,
+            "description": notebook.metadata.description,
+        });
+        let mut metadata_extra = notebook.metadata.extra.clone();
+        metadata_extra.insert("strata".to_string(), strata);
+
+        let metadata = IpynbMetadata {
+            kernelspec: Some(notebook.metadata.kernelspec.clone()),
+            language_info: Some(notebook.metadata.language_info.clone()),
+            strata: None,
+            extra: metadata_extra,
+        };
+        let cells = notebook
+            .cells
+            .iter()
+            .map(|cell| match cell.kind {
+                CellKind::Markdown => {
+                    let (metadata, attachments) = split_attachments(&cell.metadata);
+                    IpynbCell::Markdown {
+                        id: Some(cell.id.0.clone()),
+                        metadata,
+                        source: split_lines(&cell.source).into(),
+                        attachments,
+                    }
+                }
+                CellKind::Raw => {
+                    let (metadata, attachments) = split_attachments(&cell.metadata);
+                    IpynbCell::Raw {
+                        id: Some(cell.id.0.clone()),
+                        metadata,
+                        source: split_lines(&cell.source).into(),
+                        attachments,
+                    }
+                }
+                CellKind::Code | CellKind::Ai => IpynbCell::Code {
+                    id: Some(cell.id.0.clone()),
+                    metadata: cell.metadata.clone(),
+                    execution_count: cell.execution_count,
+                    source: split_lines(&cell.source).into(),
+                    outputs: cell.outputs.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let rendered = IpynbNotebook {
+            nbformat: notebook.nbformat,
+            nbformat_minor: notebook.nbformat_minor,
+            metadata,
+            cells,
+        };
+
+        serde_json::to_string_pretty(&rendered).expect("ipynb render should succeed")
+    }
+
     pub fn load_markdown(path: &Path) -> Result<Notebook> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read notebook at {}", path.display()))?;
@@ -66,7 +249,7 @@ impl NotebookStorage {
                 if !text_buffer.is_empty() {
                     let source = join_and_trim(&text_buffer);
                     if !source.is_empty() {
-                        cells.push(Cell::text(source));
+                        cells.push(Cell::markdown(source));
                     }
                     text_buffer.clear();
                 }
@@ -94,17 +277,11 @@ impl NotebookStorage {
                         kind,
                         language: meta_language,
                         source,
+                        execution_count: None,
+                        outputs: Vec::new(),
+                        metadata: BTreeMap::new(),
                     },
-                    None => Cell {
-                        id: CellId::new(),
-                        kind: if language == Language::Ai {
-                            CellKind::Ai
-                        } else {
-                            CellKind::Code
-                        },
-                        language,
-                        source,
-                    },
+                    None => Cell::code(language, source),
                 };
                 cells.push(cell);
                 index += 1;
@@ -118,11 +295,11 @@ impl NotebookStorage {
         if !text_buffer.is_empty() {
             let source = join_and_trim(&text_buffer);
             if !source.is_empty() {
-                cells.push(Cell::text(source));
+                cells.push(Cell::markdown(source));
             }
         }
 
-        Ok(Notebook { metadata, cells })
+        Ok(Notebook::new(metadata.title).with_cells(cells))
     }
 
     pub fn render_markdown(notebook: &Notebook) -> String {
@@ -133,9 +310,15 @@ impl NotebookStorage {
 
         for (index, cell) in notebook.cells.iter().enumerate() {
             match cell.kind {
-                CellKind::Text => {
+                CellKind::Markdown => {
                     output.push_str(cell.source.trim());
                     output.push('\n');
+                }
+                CellKind::Raw => {
+                    output.push_str(&format!("<!-- strata:cell id={} kind=raw language=text -->\n", cell.id.0));
+                    output.push_str("```text\n");
+                    output.push_str(cell.source.trim_end());
+                    output.push_str("\n```\n");
                 }
                 CellKind::Code | CellKind::Ai => {
                     output.push_str(&format!(
@@ -209,7 +392,8 @@ fn parse_cell_comment(line: &str) -> Result<(CellId, CellKind, Language)> {
                 "kind" => {
                     kind = Some(match value {
                         "code" => CellKind::Code,
-                        "text" => CellKind::Text,
+                        "text" | "markdown" => CellKind::Markdown,
+                        "raw" => CellKind::Raw,
                         "ai" => CellKind::Ai,
                         _ => bail!("unknown cell kind {value}"),
                     })
@@ -241,13 +425,126 @@ fn parse_language(language: &str) -> Language {
 fn render_kind(kind: CellKind) -> &'static str {
     match kind {
         CellKind::Code => "code",
-        CellKind::Text => "text",
+        CellKind::Markdown => "markdown",
+        CellKind::Raw => "raw",
         CellKind::Ai => "ai",
     }
 }
 
 fn join_and_trim(lines: &[String]) -> String {
     lines.join("\n").trim().to_string()
+}
+
+fn split_lines(source: &str) -> Vec<String> {
+    if source.is_empty() {
+        vec![String::new()]
+    } else {
+        source
+            .split_inclusive('\n')
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    }
+}
+
+fn split_attachments(
+    metadata: &BTreeMap<String, Value>,
+) -> (BTreeMap<String, Value>, serde_json::Map<String, Value>) {
+    let mut metadata = metadata.clone();
+    let attachments = metadata
+        .remove("attachments")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    (metadata, attachments)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IpynbNotebook {
+    nbformat: u8,
+    nbformat_minor: u8,
+    metadata: IpynbMetadata,
+    cells: Vec<IpynbCell>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct IpynbMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernelspec: Option<Kernelspec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language_info: Option<LanguageInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strata: Option<StrataNotebookMetadata>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StrataNotebookMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "cell_type", rename_all = "snake_case")]
+enum IpynbCell {
+    Markdown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, Value>,
+        #[serde(default)]
+        source: SourceField,
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        attachments: serde_json::Map<String, Value>,
+    },
+    Raw {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, Value>,
+        #[serde(default)]
+        source: SourceField,
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        attachments: serde_json::Map<String, Value>,
+    },
+    Code {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_count: Option<u32>,
+        #[serde(default)]
+        source: SourceField,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<CellOutput>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SourceField {
+    String(String),
+    Lines(Vec<String>),
+    #[default]
+    Empty,
+}
+
+impl SourceField {
+    fn join(self) -> String {
+        match self {
+            SourceField::String(value) => value,
+            SourceField::Lines(values) => values.concat(),
+            SourceField::Empty => String::new(),
+        }
+    }
+}
+
+impl From<Vec<String>> for SourceField {
+    fn from(value: Vec<String>) -> Self {
+        SourceField::Lines(value)
+    }
 }
 
 #[cfg(test)]
@@ -257,9 +554,9 @@ mod tests {
     #[test]
     fn markdown_round_trip_preserves_code_metadata() {
         let notebook = Notebook::new("Demo").with_cells(vec![
-            Cell::text("intro"),
+            Cell::markdown("intro"),
             Cell::code(Language::Python, "value = 1\nprint(value)"),
-            Cell::ai("optimize the function"),
+            Cell::raw("plain"),
         ]);
 
         let rendered = NotebookStorage::render_markdown(&notebook);
@@ -270,28 +567,31 @@ mod tests {
         assert_eq!(parsed.cells[1].kind, CellKind::Code);
         assert_eq!(parsed.cells[1].language, Language::Python);
         assert_eq!(parsed.cells[1].source, "value = 1\nprint(value)");
-        assert_eq!(parsed.cells[2].kind, CellKind::Ai);
+        assert_eq!(parsed.cells[2].kind, CellKind::Raw);
     }
 
     #[test]
-    fn markdown_parser_supports_javascript_and_typescript_fences() {
-        let raw = r#"# Demo
+    fn ipynb_round_trip_preserves_outputs_and_metadata() {
+        let mut notebook = Notebook::new("Demo").with_cells(vec![
+            Cell::markdown("# Intro"),
+            Cell::code(Language::Python, "print('hello')"),
+        ]);
+        notebook.cells[1].execution_count = Some(3);
+        notebook.cells[1].outputs = vec![CellOutput::Stream {
+            name: "stdout".to_string(),
+            text: "hello\n".to_string(),
+        }];
+        notebook
+            .cells[0]
+            .metadata
+            .insert("custom".to_string(), json!(true));
 
-<!-- strata:cell id=cell-0001 kind=code language=javascript -->
-```js
-console.log("hello")
-```
+        let rendered = NotebookStorage::render_ipynb(&notebook);
+        let parsed = NotebookStorage::parse_ipynb(&rendered).unwrap();
 
-<!-- strata:cell id=cell-0002 kind=code language=typescript -->
-```ts
-const value: number = 7;
-```
-"#;
-
-        let parsed = NotebookStorage::parse_markdown(raw).unwrap();
-
-        assert_eq!(parsed.cells.len(), 2);
-        assert_eq!(parsed.cells[0].language, Language::JavaScript);
-        assert_eq!(parsed.cells[1].language, Language::TypeScript);
+        assert_eq!(parsed.metadata.title, "Demo");
+        assert_eq!(parsed.cells[1].execution_count, Some(3));
+        assert_eq!(parsed.cells[1].primary_output_text(), "hello\n");
+        assert_eq!(parsed.cells[0].metadata.get("custom"), Some(&json!(true)));
     }
 }

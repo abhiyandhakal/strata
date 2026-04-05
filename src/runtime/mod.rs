@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ai::AiRuntime;
 use crate::core::{
-    ArtifactId, ArtifactRef, BridgeValue, Cell, CellKind, ExecutionId, ExecutionRecord,
-    ExecutionRequest, ExecutionStatus, Language, Notebook, SessionId, SessionManifest,
+    ArtifactId, ArtifactRef, BridgeValue, Cell, CellKind, CellOutput, ExecutionId,
+    ExecutionRecord, ExecutionRequest, ExecutionStatus, Language, Notebook, SessionId,
+    SessionManifest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,16 +116,18 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn run_cell_at(&mut self, notebook: &Notebook, index: usize) -> Result<ExecutionRecord> {
+    pub fn run_cell_at(&mut self, notebook: &mut Notebook, index: usize) -> Result<ExecutionRecord> {
         let cell = notebook
             .cells
             .get(index)
             .context("cell index out of bounds")?;
-        match cell.kind {
-            CellKind::Code => self.run_code_cell(cell),
-            CellKind::Ai => self.run_ai_cell(notebook, index),
-            CellKind::Text => bail!("text cells are not executable"),
-        }
+        let record = match cell.kind {
+            CellKind::Code => self.run_code_cell(cell)?,
+            CellKind::Ai => self.run_ai_cell(notebook, index)?,
+            CellKind::Markdown | CellKind::Raw => bail!("selected cell is not executable"),
+        };
+        apply_record_to_notebook(notebook, index, &record);
+        Ok(record)
     }
 
     pub fn run_code_cell(&mut self, cell: &Cell) -> Result<ExecutionRecord> {
@@ -142,6 +145,9 @@ impl SessionManager {
         apply_bridges(&mut self.manifest.named_values, &execution.bridges);
         self.manifest.artifacts.extend(execution.artifacts.clone());
 
+        let execution_count = self.manifest.next_execution_count;
+        self.manifest.next_execution_count += 1;
+        let outputs = build_cell_outputs(execution_count, &execution);
         let record = ExecutionRecord {
             id: ExecutionId::new(),
             cell_id: cell.id.clone(),
@@ -155,6 +161,8 @@ impl SessionManager {
             output: execution.output,
             error_output: execution.error_output,
             exit_code: execution.exit_code,
+            execution_count: Some(execution_count),
+            outputs,
             dependencies: execution.artifacts.clone(),
             bridges: execution.bridges,
         };
@@ -202,6 +210,15 @@ impl SessionManager {
             } else {
                 1
             },
+            execution_count: None,
+            outputs: if ai_run.response.is_empty() {
+                Vec::new()
+            } else {
+                vec![CellOutput::Stream {
+                    name: "stdout".to_string(),
+                    text: ai_run.response.clone(),
+                }]
+            },
             dependencies: Vec::new(),
             bridges: Vec::new(),
         };
@@ -216,6 +233,15 @@ impl SessionManager {
             .iter()
             .rev()
             .find(|record| record.cell_id.0 == cell_id)
+    }
+
+    pub fn restart_all(&mut self) -> Result<()> {
+        for kernel in &mut self.kernels {
+            kernel.restart()?;
+        }
+        self.manifest.named_values.clear();
+        self.manifest.next_execution_count = 1;
+        Ok(())
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -603,11 +629,11 @@ pub fn load_session_for_notebook(path: &Path, notebook: &Notebook) -> Result<Ses
 
 pub fn run_notebook_cells(
     session: &mut SessionManager,
-    notebook: &Notebook,
+    notebook: &mut Notebook,
 ) -> Result<Vec<ExecutionRecord>> {
     let mut records = Vec::new();
     for index in 0..notebook.cells.len() {
-        if notebook.cells[index].kind != CellKind::Text {
+        if matches!(notebook.cells[index].kind, CellKind::Code | CellKind::Ai) {
             records.push(session.run_cell_at(notebook, index)?);
         }
     }
@@ -632,6 +658,44 @@ pub fn summarize_records(records: &[ExecutionRecord]) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn build_cell_outputs(execution_count: u32, execution: &KernelExecution) -> Vec<CellOutput> {
+    let mut outputs = Vec::new();
+    if !execution.output.is_empty() {
+        outputs.push(CellOutput::Stream {
+            name: "stdout".to_string(),
+            text: execution.output.clone(),
+        });
+        outputs.push(CellOutput::ExecuteResult {
+            execution_count,
+            data: BTreeMap::from([(
+                "text/plain".to_string(),
+                serde_json::Value::String(execution.output.clone()),
+            )]),
+            metadata: BTreeMap::new(),
+        });
+    }
+    if !execution.error_output.is_empty() {
+        outputs.push(CellOutput::Error {
+            ename: "ExecutionError".to_string(),
+            evalue: execution.error_output.clone(),
+            traceback: execution
+                .error_output
+                .lines()
+                .map(ToString::to_string)
+                .collect(),
+        });
+    }
+    outputs
+}
+
+fn apply_record_to_notebook(notebook: &mut Notebook, index: usize, record: &ExecutionRecord) {
+    let Some(cell) = notebook.cells.get_mut(index) else {
+        return;
+    };
+    cell.execution_count = record.execution_count;
+    cell.outputs = record.outputs.clone();
 }
 
 #[cfg(test)]

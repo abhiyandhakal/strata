@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 static CELL_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -84,7 +85,8 @@ impl Default for ArtifactId {
 #[serde(rename_all = "snake_case")]
 pub enum CellKind {
     Code,
-    Text,
+    Markdown,
+    Raw,
     Ai,
 }
 
@@ -113,16 +115,110 @@ impl Language {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Kernelspec {
+    pub display_name: String,
+    pub language: String,
+    pub name: String,
+}
+
+impl Default for Kernelspec {
+    fn default() -> Self {
+        Self {
+            display_name: "Python 3".to_string(),
+            language: "python".to_string(),
+            name: "python3".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_extension: Option<String>,
+}
+
+impl Default for LanguageInfo {
+    fn default() -> Self {
+        Self {
+            name: "python".to_string(),
+            version: None,
+            mimetype: Some("text/x-python".to_string()),
+            file_extension: Some(".py".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NotebookMetadata {
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub kernelspec: Kernelspec,
+    #[serde(default)]
+    pub language_info: LanguageInfo,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl Default for NotebookMetadata {
     fn default() -> Self {
         Self {
-            title: "Untitled Strata Notebook".to_string(),
+            title: "Untitled Notebook".to_string(),
             description: None,
+            kernelspec: Kernelspec::default(),
+            language_info: LanguageInfo::default(),
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "output_type", rename_all = "snake_case")]
+pub enum CellOutput {
+    Stream { name: String, text: String },
+    ExecuteResult {
+        execution_count: u32,
+        data: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, Value>,
+    },
+    DisplayData {
+        data: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, Value>,
+    },
+    Error {
+        ename: String,
+        evalue: String,
+        traceback: Vec<String>,
+    },
+}
+
+impl CellOutput {
+    pub fn as_text(&self) -> String {
+        match self {
+            CellOutput::Stream { text, .. } => text.clone(),
+            CellOutput::ExecuteResult { data, .. } | CellOutput::DisplayData { data, .. } => data
+                .get("text/plain")
+                .map(render_json_value)
+                .unwrap_or_default(),
+            CellOutput::Error {
+                ename,
+                evalue,
+                traceback,
+            } => {
+                if traceback.is_empty() {
+                    format!("{ename}: {evalue}")
+                } else {
+                    traceback.join("\n")
+                }
+            }
         }
     }
 }
@@ -133,15 +229,40 @@ pub struct Cell {
     pub kind: CellKind,
     pub language: Language,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<CellOutput>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
 }
 
 impl Cell {
-    pub fn text(source: impl Into<String>) -> Self {
+    pub fn markdown(source: impl Into<String>) -> Self {
         Self {
             id: CellId::new(),
-            kind: CellKind::Text,
+            kind: CellKind::Markdown,
             language: Language::Text,
             source: source.into(),
+            execution_count: None,
+            outputs: Vec::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn text(source: impl Into<String>) -> Self {
+        Self::markdown(source)
+    }
+
+    pub fn raw(source: impl Into<String>) -> Self {
+        Self {
+            id: CellId::new(),
+            kind: CellKind::Raw,
+            language: Language::Text,
+            source: source.into(),
+            execution_count: None,
+            outputs: Vec::new(),
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -151,6 +272,9 @@ impl Cell {
             kind: CellKind::Code,
             language,
             source: source.into(),
+            execution_count: None,
+            outputs: Vec::new(),
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -160,13 +284,27 @@ impl Cell {
             kind: CellKind::Ai,
             language: Language::Ai,
             source: source.into(),
+            execution_count: None,
+            outputs: Vec::new(),
+            metadata: BTreeMap::new(),
         }
+    }
+
+    pub fn primary_output_text(&self) -> String {
+        self.outputs
+            .iter()
+            .map(CellOutput::as_text)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Notebook {
     pub metadata: NotebookMetadata,
+    pub nbformat: u8,
+    pub nbformat_minor: u8,
     pub cells: Vec<Cell>,
 }
 
@@ -175,8 +313,10 @@ impl Notebook {
         Self {
             metadata: NotebookMetadata {
                 title: title.into(),
-                description: None,
+                ..NotebookMetadata::default()
             },
+            nbformat: 4,
+            nbformat_minor: 5,
             cells: Vec::new(),
         }
     }
@@ -236,6 +376,10 @@ pub struct ExecutionRecord {
     pub output: String,
     pub error_output: String,
     pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<CellOutput>,
     pub dependencies: Vec<ArtifactRef>,
     pub bridges: Vec<BridgeValue>,
 }
@@ -253,6 +397,38 @@ pub struct AiRunRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UiState {
+    pub selected_cell: usize,
+    pub viewport_row: usize,
+    pub cell_modes: BTreeMap<String, CellUiState>,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            selected_cell: 0,
+            viewport_row: 0,
+            cell_modes: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CellUiState {
+    pub rendered: bool,
+    pub output_collapsed: bool,
+}
+
+impl Default for CellUiState {
+    fn default() -> Self {
+        Self {
+            rendered: true,
+            output_collapsed: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionManifest {
     pub session_id: SessionId,
     pub notebook_title: String,
@@ -260,6 +436,9 @@ pub struct SessionManifest {
     pub ai_history: Vec<AiRunRecord>,
     pub execution_history: Vec<ExecutionRecord>,
     pub artifacts: Vec<ArtifactRef>,
+    pub next_execution_count: u32,
+    #[serde(default)]
+    pub ui_state: UiState,
 }
 
 impl SessionManifest {
@@ -271,6 +450,15 @@ impl SessionManifest {
             ai_history: Vec::new(),
             execution_history: Vec::new(),
             artifacts: Vec::new(),
+            next_execution_count: 1,
+            ui_state: UiState::default(),
         }
+    }
+}
+
+fn render_json_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }

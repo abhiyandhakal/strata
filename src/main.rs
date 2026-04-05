@@ -39,7 +39,7 @@ fn open_command(path: Option<PathBuf>) -> Result<()> {
     let config = StrataConfig::load()?;
     let (notebook, notebook_path, session) = match path {
         Some(path) => {
-            let notebook = NotebookStorage::load_markdown(&path)?;
+            let notebook = NotebookStorage::load(&path)?;
             let session = load_session_for_notebook(&path, &notebook)?;
             (notebook, Some(path), session)
         }
@@ -53,20 +53,21 @@ fn open_command(path: Option<PathBuf>) -> Result<()> {
     if should_launch_tui() {
         App::new(notebook, notebook_path, session, config.editor.vim_mode).run()?;
     } else {
-        println!("{}", NotebookStorage::render_markdown(&notebook));
+        println!("{}", NotebookStorage::render(notebook_path.as_deref(), &notebook));
     }
 
     Ok(())
 }
 
 fn run_command(path: PathBuf) -> Result<()> {
-    let notebook = NotebookStorage::load_markdown(&path)?;
+    let mut notebook = NotebookStorage::load(&path)?;
     let checkpoint_paths = CheckpointPaths::for_notebook(&path);
     let mut session = load_session_for_notebook(&path, &notebook)?;
 
-    let records = run_notebook_cells(&mut session, &notebook)
+    let records = run_notebook_cells(&mut session, &mut notebook)
         .with_context(|| format!("failed to execute notebook {}", path.display()))?;
     CheckpointStorage::save(&checkpoint_paths, &session.manifest)?;
+    NotebookStorage::save(&path, &notebook)?;
     session.shutdown()?;
 
     if records.is_empty() {
