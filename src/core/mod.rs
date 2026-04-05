@@ -574,6 +574,8 @@ impl Default for UiState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CellUiState {
     pub rendered: bool,
+    #[serde(default)]
+    pub body_collapsed: bool,
     pub output_collapsed: bool,
 }
 
@@ -581,6 +583,7 @@ impl Default for CellUiState {
     fn default() -> Self {
         Self {
             rendered: true,
+            body_collapsed: false,
             output_collapsed: false,
         }
     }
