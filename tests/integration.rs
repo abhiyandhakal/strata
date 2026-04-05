@@ -7,7 +7,7 @@ use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use reqwest::blocking::Client;
 use strata::ai::{AiConfig, AiRuntime, ContextSelector, HeuristicContextSelector};
-use strata::core::{Cell, ExecutionStatus, Language, Notebook, SessionManifest};
+use strata::core::{Cell, CellOutput, ExecutionStatus, Language, Notebook, SessionManifest};
 use strata::runtime::{SessionManager, summarize_records};
 use strata::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
 use tempfile::TempDir;
@@ -344,6 +344,32 @@ console.log(globalThis.count);
         .assert()
         .success()
         .stdout(contains("7"));
+}
+
+#[test]
+fn cli_run_updates_ipynb_outputs_and_execution_counts() {
+    let temp = TempDir::new().unwrap();
+    let notebook_path = temp.path().join("flow.ipynb");
+    let notebook = Notebook::new("Flow").with_cells(vec![
+        Cell::markdown("# Flow"),
+        Cell::code(Language::Python, "print('hello from ipynb')"),
+    ]);
+    NotebookStorage::save(&notebook_path, &notebook).unwrap();
+
+    Command::cargo_bin("strata")
+        .unwrap()
+        .arg("run")
+        .arg(&notebook_path)
+        .assert()
+        .success()
+        .stdout(contains("hello from ipynb"));
+
+    let persisted = NotebookStorage::load(&notebook_path).unwrap();
+    assert_eq!(persisted.cells[1].execution_count, Some(1));
+    assert!(matches!(
+        persisted.cells[1].outputs.first(),
+        Some(CellOutput::Stream { .. })
+    ));
 }
 
 #[test]
