@@ -1133,26 +1133,40 @@ impl App {
             CellKind::Raw => "[Raw]".to_string(),
             CellKind::Ai => "[AI]".to_string(),
         };
-        let mut lines = vec![prompt];
-        lines.extend(text_lines_for_target(
-            cell,
-            CopyTarget::CellBody,
-            self.notebook_path.as_deref(),
-        ));
+        let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
+        let body_text = match cell.kind {
+            CellKind::Markdown if rendered => {
+                Text::from(
+                    render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme)
+                        .blocks
+                        .into_iter()
+                        .flat_map(|block| match block {
+                            MarkdownBlock::Text { line, .. } => vec![line],
+                            MarkdownBlock::Image { alt, .. } => {
+                                vec![Line::from(vec![Span::styled(
+                                    alt,
+                                    self.theme.style("markdown.image.link"),
+                                )])]
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            CellKind::Code => render_code_block(cell, &self.theme),
+            _ => Text::from(cell.source.clone()),
+        };
+        let mut lines = Vec::new();
+        lines.push(Line::from(prompt));
+        lines.extend(body_text.lines);
         if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
-            lines.push("Output".to_string());
-            lines.extend(
-                output_text(cell, self.notebook_path.as_deref())
-                    .lines()
-                    .map(ToString::to_string),
-            );
+            lines.push(Line::from("Output"));
+            lines.extend(render_output_block(cell, &self.theme).lines);
         }
         let text = Text::from(
             lines
                 .into_iter()
                 .skip(top_skip as usize)
                 .take(area.height as usize)
-                .map(Line::from)
                 .collect::<Vec<_>>(),
         );
         frame.render_widget(
@@ -3832,5 +3846,32 @@ mod tests {
             .unwrap();
 
         assert!(app.cell_mode(&app.notebook.cells[0]).body_collapsed);
+    }
+
+    #[test]
+    fn clipped_code_cells_preserve_syntax_highlighting() {
+        let notebook = Notebook::new("Clip").with_cells(vec![Cell::code(
+            Language::Python,
+            "def region_init_mean(x):\n    return x\n",
+        )]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.scroll_offset = 1;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("def"));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "d" && cell.fg != ratatui::style::Color::Reset));
     }
 }
