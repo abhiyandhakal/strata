@@ -675,6 +675,14 @@ impl App {
     }
 
     fn handle_edit_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('z') {
+            self.apply_editor_to_cell();
+            self.mode = AppMode::Command;
+            self.vim = None;
+            self.toggle_body_for_selected();
+            self.refresh_status();
+            return Ok(false);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.copy_editor_selection()?;
             return Ok(false);
@@ -1110,12 +1118,12 @@ impl App {
             width: inner.width,
             height: 1,
         };
-        frame.render_widget(Paragraph::new(chrome), chrome_area);
-        self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
         self.hit_regions.push(HitRegion {
             rect: area,
             target: HitTarget::CellSelect(index),
         });
+        frame.render_widget(Paragraph::new(chrome), chrome_area);
+        self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
 
         let input_area = Rect {
             x: inner.x,
@@ -1542,10 +1550,10 @@ impl App {
         self.status = match (self.mode, self.vim_mode()) {
             (AppMode::Command, _) => "command: click cells/buttons | y copy | Y copy block | gy copy output | z fold | o output | e edit | r run | R run all | c code | m markdown | d delete | ctrl-s save | q quit".to_string(),
             (AppMode::Edit, Some(VimMode::Normal)) => {
-                "edit vim NORMAL: i insert | y copy in VISUAL | Esc exit editor | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
+                "edit vim NORMAL: i insert | y copy in VISUAL | Esc exit editor | alt-z fold | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
             (AppMode::Edit, Some(VimMode::Insert)) => {
-                "edit vim INSERT: Esc normal | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
+                "edit vim INSERT: Esc normal | alt-z fold | ctrl-c copy | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
             (AppMode::Edit, Some(VimMode::Visual)) => {
                 "edit vim VISUAL: y copy to clipboard | d delete | c change | Esc normal".to_string()
@@ -1554,7 +1562,7 @@ impl App {
                 "edit vim OPERATOR: motion applies pending operator".to_string()
             }
             (AppMode::Edit, None) => {
-                "edit: Esc finish | ctrl-s save | ctrl-r run | shift-enter run".to_string()
+                "edit: Esc finish | alt-z fold | ctrl-s save | ctrl-r run | shift-enter run".to_string()
             }
         };
     }
@@ -2864,5 +2872,51 @@ mod tests {
 
         assert!(collapsed < expanded);
         assert!(!app.cell_mode(&app.notebook.cells[0]).body_collapsed);
+    }
+
+    #[test]
+    fn hit_test_prefers_specific_button_region_over_cell_region() {
+        let notebook = Notebook::new("Fold").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        app.hit_regions = vec![
+            HitRegion {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 1,
+                },
+                target: HitTarget::CellSelect(0),
+            },
+            HitRegion {
+                rect: Rect {
+                    x: 5,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                target: HitTarget::CellToggleBody(0),
+            },
+        ];
+
+        let hit = app.hit_test(6, 0);
+
+        assert!(matches!(hit, Some(HitTarget::CellToggleBody(0))));
+    }
+
+    #[test]
+    fn alt_z_folds_selected_cell_from_edit_mode() {
+        let notebook =
+            Notebook::new("FoldEdit").with_cells(vec![Cell::code(Language::Python, "print(1)")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.enter_edit_mode();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Command);
+        assert!(app.cell_mode(&app.notebook.cells[0]).body_collapsed);
     }
 }
