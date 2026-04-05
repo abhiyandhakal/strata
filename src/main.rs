@@ -12,21 +12,33 @@ use strata::tui::{App, should_launch_tui};
 
 #[derive(Parser)]
 #[command(name = "strata")]
-#[command(about = "Terminal-native structured execution")]
+#[command(
+    about = "Terminal-native notebook runner and editor",
+    long_about = "Strata works directly with `.smd` notebooks.\n\nUse `strata <notebook.smd>` to open the notebook UI in a real terminal, or to execute the notebook headlessly in a non-interactive environment.\n\nUse `import` and `export` to convert between `.ipynb` and `.smd`.",
+    override_usage = "strata <notebook.smd>\n       strata import <input.ipynb> [output.smd]\n       strata export <input.smd> [output.ipynb]",
+    after_help = "Examples:\n  strata notes.smd\n  strata import analysis.ipynb\n  strata import analysis.ipynb analysis.smd\n  strata export analysis.smd\n  strata export analysis.smd analysis.ipynb"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    #[arg(help = "Path to a Strata `.smd` notebook to open or run", value_name = "NOTEBOOK")]
     path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Convert a Jupyter `.ipynb` notebook into a Strata `.smd` notebook")]
     Import {
+        #[arg(help = "Input Jupyter notebook", value_name = "INPUT_IPYNB")]
         input: PathBuf,
+        #[arg(help = "Optional output `.smd` path", value_name = "OUTPUT_SMD")]
         output: Option<PathBuf>,
     },
+    #[command(about = "Convert a Strata `.smd` notebook into a Jupyter `.ipynb` notebook")]
     Export {
+        #[arg(help = "Input Strata notebook", value_name = "INPUT_SMD")]
         input: PathBuf,
+        #[arg(help = "Optional output `.ipynb` path", value_name = "OUTPUT_IPYNB")]
         output: Option<PathBuf>,
     },
 }
