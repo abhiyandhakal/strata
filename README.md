@@ -28,6 +28,29 @@ cargo run -- run path/to/notebook.ipynb
 
 If no path is provided, Strata opens an in-memory demo notebook.
 
+## Install As A Command
+
+To install `strata` so it can be run from anywhere without `cargo run` or a binary path:
+
+```bash
+./scripts/install-local.sh
+```
+
+That builds the release binary and installs it to `~/.local/bin/strata` by default.
+
+Override the install location if needed:
+
+```bash
+STRATA_INSTALL_DIR=/some/bin ./scripts/install-local.sh
+```
+
+If your shell already has `~/.local/bin` on `PATH`, you can then run:
+
+```bash
+strata --help
+strata open path/to/notebook.ipynb
+```
+
 ## Notebook Format
 
 Strata now treats `.ipynb` as the primary notebook format.
