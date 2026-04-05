@@ -535,7 +535,7 @@ impl MouseTextSelection {
 
 pub struct App {
     pub notebook: Notebook,
-    pub selected: usize,
+    pub selected: Option<usize>,
     pub status: String,
     notebook_path: Option<PathBuf>,
     checkpoint_paths: Option<CheckpointPaths>,
@@ -609,10 +609,11 @@ impl App {
                 });
         }
 
-        let selected = usize::min(
-            session.manifest.ui_state.selected_cell,
-            notebook.cells.len().saturating_sub(1),
-        );
+        let selected = session
+            .manifest
+            .ui_state
+            .selected_cell
+            .map(|selected| usize::min(selected, notebook.cells.len().saturating_sub(1)));
         let viewport_row = session.manifest.ui_state.viewport_row as u16;
         let mut app = Self {
             notebook,
@@ -706,6 +707,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Esc => self.clear_selection(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('e') | KeyCode::Enter => self.enter_edit_mode(),
@@ -726,8 +728,8 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.save_all()?
             }
-            KeyCode::PageDown => self.scroll_cells(self.page_scroll_amount()),
-            KeyCode::PageUp => self.scroll_cells(-self.page_scroll_amount()),
+            KeyCode::PageDown => self.scroll_rows(self.page_scroll_amount()),
+            KeyCode::PageUp => self.scroll_rows(-self.page_scroll_amount()),
             _ => {}
         }
 
@@ -811,18 +813,18 @@ impl App {
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll_cells(1);
+                self.scroll_rows(1);
                 return Ok(());
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_cells(-1);
+                self.scroll_rows(-1);
                 return Ok(());
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(target) = self.hit_test(mouse.column, mouse.row) {
                     match target.clone() {
                         HitTarget::CellEditor(index)
-                            if index == self.selected && self.mode == AppMode::Edit =>
+                            if self.selected == Some(index) && self.mode == AppMode::Edit =>
                         {
                             self.drag_selection = true;
                             self.activate_hit_target(target, mouse.column, mouse.row)?;
@@ -837,7 +839,7 @@ impl App {
                                 })
                                 .unwrap_or(false);
                             self.last_click = Some((index, Instant::now()));
-                            self.selected = index;
+                            self.selected = Some(index);
                             self.copy_target = CopyTarget::CellBody;
                             self.clear_mouse_text_selection();
                             self.load_selected_into_editor();
@@ -859,7 +861,7 @@ impl App {
                             }
                         }
                         HitTarget::CellOutput(index) if self.mode == AppMode::Command => {
-                            self.selected = index;
+                            self.selected = Some(index);
                             self.copy_target = CopyTarget::CellOutput;
                             self.clear_mouse_text_selection();
                             self.load_selected_into_editor();
@@ -880,7 +882,7 @@ impl App {
                         }
                         HitTarget::CellSelect(index) => {
                             self.last_click = Some((index, Instant::now()));
-                            self.selected = index;
+                            self.selected = Some(index);
                             self.copy_target = CopyTarget::CellBody;
                             self.clear_mouse_text_selection();
                             self.load_selected_into_editor();
@@ -1063,30 +1065,104 @@ impl App {
             return;
         }
 
-        let mut cursor_y = area.y;
-        let start = usize::min(
-            self.scroll_offset as usize,
-            self.notebook.cells.len().saturating_sub(1),
-        );
-        for index in start..self.notebook.cells.len() {
+        let viewport_top = self.scroll_offset;
+        let viewport_bottom = viewport_top.saturating_add(area.height);
+        let mut cell_top = 0u16;
+        for index in 0..self.notebook.cells.len() {
             let cell = self.notebook.cells[index].clone();
-            let remaining = area.y.saturating_add(area.height).saturating_sub(cursor_y);
-            if remaining < 4 {
+            let full_height = self.cell_height(index).saturating_add(1);
+            let cell_bottom = cell_top.saturating_add(full_height);
+            if cell_bottom <= viewport_top {
+                cell_top = cell_bottom;
+                continue;
+            }
+            if cell_top >= viewport_bottom {
                 break;
             }
-            let height = self.cell_height(index).min(remaining);
+            let visible_top = cell_top.max(viewport_top);
+            let visible_bottom = cell_bottom.min(viewport_bottom);
+            let height = visible_bottom.saturating_sub(visible_top).min(area.height);
+            if height == 0 {
+                cell_top = cell_bottom;
+                continue;
+            }
             let cell_area = Rect {
                 x: area.x,
-                y: cursor_y,
+                y: area
+                    .y
+                    .saturating_add(visible_top.saturating_sub(viewport_top)),
                 width: area.width,
                 height,
             };
-            self.draw_cell(frame, area, cell_area, index, &cell);
-            cursor_y = cursor_y.saturating_add(height.saturating_add(1));
-            if cursor_y >= area.y.saturating_add(area.height) {
-                break;
+            let top_skip = visible_top.saturating_sub(cell_top);
+            if top_skip == 0 {
+                self.draw_cell(frame, area, cell_area, index, &cell);
+            } else {
+                self.draw_clipped_cell(frame, cell_area, index, &cell, top_skip);
             }
+            cell_top = cell_bottom;
         }
+    }
+
+    fn draw_clipped_cell(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        index: usize,
+        cell: &Cell,
+        top_skip: u16,
+    ) {
+        let selected = self.selected == Some(index);
+        let style = if selected {
+            self.theme.style("cell.shell.selected")
+        } else {
+            self.theme.style("cell.shell")
+        };
+        let border = if selected {
+            self.theme.style("cell.border.selected")
+        } else {
+            self.theme.style("cell.border")
+        };
+        let prompt = match cell.kind {
+            CellKind::Code => format!(
+                "In [{}]:",
+                cell.execution_count
+                    .map_or(" ".to_string(), |n| n.to_string())
+            ),
+            CellKind::Markdown => "[Markdown]".to_string(),
+            CellKind::Raw => "[Raw]".to_string(),
+            CellKind::Ai => "[AI]".to_string(),
+        };
+        let mut lines = vec![prompt];
+        lines.extend(text_lines_for_target(
+            cell,
+            CopyTarget::CellBody,
+            self.notebook_path.as_deref(),
+        ));
+        if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
+            lines.push("Output".to_string());
+            lines.extend(
+                output_text(cell, self.notebook_path.as_deref())
+                    .lines()
+                    .map(ToString::to_string),
+            );
+        }
+        let text = Text::from(
+            lines
+                .into_iter()
+                .skip(top_skip as usize)
+                .take(area.height as usize)
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        );
+        frame.render_widget(
+            Paragraph::new(text).style(style).block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .border_style(border),
+            ),
+            area,
+        );
     }
 
     fn draw_cell(
@@ -1097,7 +1173,7 @@ impl App {
         index: usize,
         cell: &Cell,
     ) {
-        let selected = index == self.selected;
+        let selected = self.selected == Some(index);
         let shell_style = if selected {
             self.theme.style("cell.shell.selected")
         } else {
@@ -1362,17 +1438,35 @@ impl App {
             return;
         }
         let max_index = self.notebook.cells.len().saturating_sub(1) as isize;
-        let next = (self.selected as isize + delta).clamp(0, max_index) as usize;
-        self.selected = next;
+        let base = self.selected.unwrap_or_else(|| {
+            if delta >= 0 {
+                0
+            } else {
+                self.notebook.cells.len().saturating_sub(1)
+            }
+        }) as isize;
+        let next = (base + delta).clamp(0, max_index) as usize;
+        self.selected = Some(next);
         self.copy_target = CopyTarget::CellBody;
         self.clear_mouse_text_selection();
         self.load_selected_into_editor();
         self.ensure_selected_visible();
     }
 
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.copy_target = CopyTarget::CellBody;
+        self.command_prefix = None;
+        self.clear_mouse_text_selection();
+        self.status = "selection cleared".to_string();
+    }
+
     fn load_selected_into_editor(&mut self) {
         self.editor = TextArea::default();
-        if let Some(cell) = self.notebook.cells.get(self.selected) {
+        if let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        {
             self.editor = TextArea::from(cell.source.lines().map(|line| line.to_string()));
         }
         self.editor
@@ -1385,13 +1479,21 @@ impl App {
     }
 
     fn apply_editor_to_cell(&mut self) {
-        if let Some(cell) = self.notebook.cells.get_mut(self.selected) {
+        if let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get_mut(selected))
+        {
             cell.source = self.editor.lines().join("\n");
         }
     }
 
     fn insert_code_cell(&mut self) {
-        let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
+        let next = usize::min(
+            self.selected
+                .map(|selected| selected.saturating_add(1))
+                .unwrap_or(self.notebook.cells.len()),
+            self.notebook.cells.len(),
+        );
         self.notebook
             .cells
             .insert(next, Cell::code(Language::Python, String::new()));
@@ -1399,14 +1501,19 @@ impl App {
             self.notebook.cells[next].id.0.clone(),
             CellUiState::default(),
         );
-        self.selected = next;
+        self.selected = Some(next);
         self.copy_target = CopyTarget::CellBody;
         self.enter_edit_mode();
         self.status = "inserted code cell".to_string();
     }
 
     fn insert_markdown_cell(&mut self) {
-        let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
+        let next = usize::min(
+            self.selected
+                .map(|selected| selected.saturating_add(1))
+                .unwrap_or(self.notebook.cells.len()),
+            self.notebook.cells.len(),
+        );
         self.notebook
             .cells
             .insert(next, Cell::markdown(String::new()));
@@ -1418,20 +1525,27 @@ impl App {
                 output_collapsed: false,
             },
         );
-        self.selected = next;
+        self.selected = Some(next);
         self.copy_target = CopyTarget::CellBody;
         self.enter_edit_mode();
         self.status = "inserted markdown cell".to_string();
     }
 
     fn delete_selected_cell(&mut self) {
+        let Some(selected) = self.selected else {
+            self.status = "no cell selected".to_string();
+            return;
+        };
         if self.notebook.cells.is_empty() {
             return;
         }
-        let removed = self.notebook.cells.remove(self.selected);
+        let removed = self.notebook.cells.remove(selected);
         self.cell_modes.remove(&removed.id.0);
-        if self.selected >= self.notebook.cells.len() && !self.notebook.cells.is_empty() {
-            self.selected = self.notebook.cells.len() - 1;
+        if !self.notebook.cells.is_empty() {
+            let next = selected.min(self.notebook.cells.len() - 1);
+            self.selected = Some(next);
+        } else {
+            self.selected = None;
         }
         self.ensure_notebook_not_empty();
         self.copy_target = CopyTarget::CellBody;
@@ -1443,7 +1557,7 @@ impl App {
     fn ensure_notebook_not_empty(&mut self) {
         if self.notebook.cells.is_empty() {
             self.notebook.cells.push(Cell::markdown(String::new()));
-            self.selected = 0;
+            self.selected = Some(0);
         }
     }
 
@@ -1474,8 +1588,12 @@ impl App {
     }
 
     fn run_selected_cell(&mut self) -> Result<()> {
+        let Some(selected) = self.selected else {
+            self.status = "no cell selected".to_string();
+            return Ok(());
+        };
         self.apply_editor_to_cell();
-        if let Some(cell) = self.notebook.cells.get(self.selected) {
+        if let Some(cell) = self.notebook.cells.get(selected) {
             if !self.is_cell_runnable(cell) {
                 self.status = format!(
                     "cell is not runnable under kernel={} env={}",
@@ -1485,9 +1603,7 @@ impl App {
                 return Ok(());
             }
         }
-        let record = self
-            .session
-            .run_cell_at(&mut self.notebook, self.selected)?;
+        let record = self.session.run_cell_at(&mut self.notebook, selected)?;
         self.save_checkpoint_only()?;
         self.status = format!(
             "ran {} -> {:?} (exit {})",
@@ -1505,7 +1621,7 @@ impl App {
         self.apply_editor_to_cell();
         for index in 0..self.notebook.cells.len() {
             if self.is_cell_runnable(&self.notebook.cells[index]) {
-                self.selected = index;
+                self.selected = Some(index);
                 self.session.run_cell_at(&mut self.notebook, index)?;
             }
         }
@@ -1568,10 +1684,14 @@ impl App {
     }
 
     fn enter_edit_mode(&mut self) {
+        let Some(selected) = self.selected else {
+            self.status = "no cell selected".to_string();
+            return;
+        };
         self.mode = AppMode::Edit;
         self.copy_target = CopyTarget::CellBody;
         self.clear_mouse_text_selection();
-        if let Some(cell) = self.notebook.cells.get(self.selected) {
+        if let Some(cell) = self.notebook.cells.get(selected) {
             self.cell_modes
                 .entry(cell.id.0.clone())
                 .or_default()
@@ -1606,14 +1726,22 @@ impl App {
     }
 
     fn toggle_output_for_selected(&mut self) {
-        if let Some(cell) = self.notebook.cells.get(self.selected) {
+        if let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        {
             let mode = self.cell_modes.entry(cell.id.0.clone()).or_default();
             mode.output_collapsed = !mode.output_collapsed;
+        } else {
+            self.status = "no cell selected".to_string();
         }
     }
 
     fn toggle_body_for_selected(&mut self) {
-        if let Some(cell) = self.notebook.cells.get(self.selected) {
+        if let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        {
             let mode = self.cell_modes.entry(cell.id.0.clone()).or_default();
             mode.body_collapsed = !mode.body_collapsed;
             if mode.body_collapsed {
@@ -1621,6 +1749,8 @@ impl App {
                 self.mode = AppMode::Command;
                 self.vim = None;
             }
+        } else {
+            self.status = "no cell selected".to_string();
         }
     }
 
@@ -1722,13 +1852,13 @@ impl App {
             HitTarget::ToolbarAddCode => self.insert_code_cell(),
             HitTarget::ToolbarAddMarkdown => self.insert_markdown_cell(),
             HitTarget::CellSelect(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.load_selected_into_editor();
                 self.ensure_selected_visible();
             }
             HitTarget::CellEditor(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.enter_edit_mode();
                 if let Some(rect) = self.active_editor_rect {
@@ -1736,28 +1866,28 @@ impl App {
                 }
             }
             HitTarget::CellOutput(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellOutput;
                 self.load_selected_into_editor();
                 self.ensure_selected_visible();
             }
             HitTarget::CellRun(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.run_selected_cell()?;
             }
             HitTarget::CellEdit(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.enter_edit_mode();
             }
             HitTarget::CellToggleBody(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.toggle_body_for_selected();
             }
             HitTarget::CellToggleRender(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 if let Some(cell) = self.notebook.cells.get(index) {
                     let mode = self.cell_modes.entry(cell.id.0.clone()).or_default();
@@ -1765,22 +1895,22 @@ impl App {
                 }
             }
             HitTarget::CellToggleOutput(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellOutput;
                 self.toggle_output_for_selected();
             }
             HitTarget::CellOpenImage(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellOutput;
                 self.open_selected_visual()?;
             }
             HitTarget::MarkdownImageOpen(index, block_index, link_index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.open_markdown_image(index, block_index, link_index)?;
             }
             HitTarget::CellInsertBelow(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 if matches!(self.notebook.cells[index].kind, CellKind::Markdown) {
                     self.insert_markdown_cell();
@@ -1789,7 +1919,7 @@ impl App {
                 }
             }
             HitTarget::CellDelete(index) => {
-                self.selected = index;
+                self.selected = Some(index);
                 self.copy_target = CopyTarget::CellBody;
                 self.delete_selected_cell();
             }
@@ -1909,7 +2039,7 @@ impl App {
         if cell.kind == CellKind::Markdown && self.cell_mode(cell).rendered {
             return self.markdown_rendered_height(cell);
         }
-        let lines = if index == self.selected && self.mode == AppMode::Edit {
+        let lines = if self.selected == Some(index) && self.mode == AppMode::Edit {
             self.editor.lines().len().max(1)
         } else {
             cell.source.lines().count().max(1)
@@ -2051,7 +2181,7 @@ impl App {
                         width: inner.width,
                         height: 1,
                     };
-                    let highlighted = if index == self.selected
+                    let highlighted = if self.selected == Some(index)
                         && self.copy_target == CopyTarget::CellBody
                     {
                         let selection = self.mouse_text_selection_for(index, CopyTarget::CellBody);
@@ -2130,25 +2260,26 @@ impl App {
                             alt.clone(),
                             link_style,
                         )])]);
-                        let text =
-                            if index == self.selected && self.copy_target == CopyTarget::CellBody {
-                                let selection =
-                                    self.mouse_text_selection_for(index, CopyTarget::CellBody);
-                                selection
-                                    .and_then(|selection| {
-                                        markdown_selection_line(selection, block_index)
-                                    })
-                                    .map(|selection| {
-                                        apply_mouse_selection_to_text(
-                                            text.clone(),
-                                            Some(selection),
-                                            self.theme.style("cell.prompt.selected"),
-                                        )
-                                    })
-                                    .unwrap_or(text)
-                            } else {
-                                text
-                            };
+                        let text = if self.selected == Some(index)
+                            && self.copy_target == CopyTarget::CellBody
+                        {
+                            let selection =
+                                self.mouse_text_selection_for(index, CopyTarget::CellBody);
+                            selection
+                                .and_then(|selection| {
+                                    markdown_selection_line(selection, block_index)
+                                })
+                                .map(|selection| {
+                                    apply_mouse_selection_to_text(
+                                        text.clone(),
+                                        Some(selection),
+                                        self.theme.style("cell.prompt.selected"),
+                                    )
+                                })
+                                .unwrap_or(text)
+                        } else {
+                            text
+                        };
                         frame.render_widget(Paragraph::new(text), line_area);
                         if !*missing {
                             self.hit_regions.push(HitRegion {
@@ -2209,58 +2340,50 @@ impl App {
         (lines as u16).min(8) + 2
     }
 
-    fn scroll_cells(&mut self, delta: isize) {
-        if self.notebook.cells.is_empty() {
-            return;
-        }
-        let max_index = self.notebook.cells.len().saturating_sub(1) as isize;
-        let next = (self.scroll_offset as isize + delta).clamp(0, max_index) as u16;
-        self.scroll_offset = next;
+    fn total_notebook_height(&self) -> u16 {
+        self.notebook
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, _)| self.cell_height(index).saturating_add(1))
+            .sum()
+    }
+
+    fn scroll_rows(&mut self, delta: isize) {
+        let max_offset = self
+            .total_notebook_height()
+            .saturating_sub(self.notebook_area.height.max(1)) as isize;
+        self.scroll_offset = (self.scroll_offset as isize + delta).clamp(0, max_offset) as u16;
     }
 
     fn page_scroll_amount(&self) -> isize {
-        let mut visible = 0usize;
-        let mut used = 0u16;
-        let height = self.notebook_area.height.max(1);
-        for index in self.scroll_offset as usize..self.notebook.cells.len() {
-            let cell_height = self.cell_height(index).saturating_add(1);
-            if used.saturating_add(cell_height) > height {
-                break;
-            }
-            used = used.saturating_add(cell_height);
-            visible += 1;
-        }
-        visible.saturating_sub(1).max(1) as isize
+        self.notebook_area.height.saturating_sub(1).max(1) as isize
     }
 
     fn clamp_scroll_offset(&mut self) {
-        if self.notebook.cells.is_empty() {
-            self.scroll_offset = 0;
-            return;
-        }
-        let max = self.notebook.cells.len().saturating_sub(1) as u16;
+        let max = self
+            .total_notebook_height()
+            .saturating_sub(self.notebook_area.height.max(1));
         self.scroll_offset = self.scroll_offset.min(max);
     }
 
     fn ensure_selected_visible(&mut self) {
         self.clamp_scroll_offset();
-        let top = self.scroll_offset as usize;
-        if self.selected < top {
-            self.scroll_offset = self.selected as u16;
+        let Some(selected) = self.selected else {
             return;
+        };
+        let mut cell_top = 0u16;
+        for index in 0..selected {
+            cell_top = cell_top.saturating_add(self.cell_height(index).saturating_add(1));
         }
-        let available = self.notebook_area.height;
-        let mut used = 0u16;
-        let mut new_top = top;
-        for index in top..=self.selected {
-            let height = self.cell_height(index).saturating_add(1);
-            used = used.saturating_add(height);
-            while used > available && new_top < self.selected {
-                used = used.saturating_sub(self.cell_height(new_top).saturating_add(1));
-                new_top += 1;
-            }
+        let cell_bottom = cell_top.saturating_add(self.cell_height(selected).saturating_add(1));
+        let viewport_top = self.scroll_offset;
+        let viewport_bottom = viewport_top.saturating_add(self.notebook_area.height.max(1));
+        if cell_top < viewport_top {
+            self.scroll_offset = cell_top;
+        } else if cell_bottom > viewport_bottom {
+            self.scroll_offset = cell_bottom.saturating_sub(self.notebook_area.height.max(1));
         }
-        self.scroll_offset = new_top as u16;
     }
 
     fn python_lsp_style(&self) -> Style {
@@ -2334,7 +2457,11 @@ impl App {
     }
 
     fn open_selected_visual(&mut self) -> Result<()> {
-        let Some(cell) = self.notebook.cells.get(self.selected) else {
+        let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        else {
+            self.status = "no cell selected".to_string();
             return Ok(());
         };
         if let Some(output) = self.first_image_output(cell) {
@@ -2391,7 +2518,11 @@ impl App {
         if let Some(text) = self.selected_mouse_text(CopyTarget::CellBody) {
             return self.copy_text("selection", &text);
         }
-        let Some(cell) = self.notebook.cells.get(self.selected) else {
+        let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        else {
+            self.status = "no cell selected".to_string();
             return Ok(());
         };
         let source = cell.source.clone();
@@ -2399,7 +2530,11 @@ impl App {
     }
 
     fn copy_selected_cell_block(&mut self) -> Result<()> {
-        let Some(cell) = self.notebook.cells.get(self.selected) else {
+        let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        else {
+            self.status = "no cell selected".to_string();
             return Ok(());
         };
         let block = match cell.kind {
@@ -2420,7 +2555,11 @@ impl App {
         if let Some(text) = self.selected_mouse_text(CopyTarget::CellOutput) {
             return self.copy_text("selection", &text);
         }
-        let Some(cell) = self.notebook.cells.get(self.selected) else {
+        let Some(cell) = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))
+        else {
+            self.status = "no cell selected".to_string();
             return Ok(());
         };
         let text = output_text(cell, self.notebook_path.as_deref());
@@ -2467,13 +2606,15 @@ impl App {
 
     fn selected_mouse_text(&self, target: CopyTarget) -> Option<String> {
         let selection = self.mouse_text_selection?;
-        if selection.cell_index != self.selected
+        if Some(selection.cell_index) != self.selected
             || selection.target != target
             || selection.is_empty()
         {
             return None;
         }
-        let cell = self.notebook.cells.get(self.selected)?;
+        let cell = self
+            .selected
+            .and_then(|selected| self.notebook.cells.get(selected))?;
         let lines = text_lines_for_target(cell, target, self.notebook_path.as_deref());
         extract_selected_text(&lines, selection)
     }
@@ -3334,9 +3475,50 @@ mod tests {
 
         app.move_selection(5);
 
-        assert_eq!(app.selected, 5);
+        assert_eq!(app.selected, Some(5));
         assert!(app.scroll_offset > 0);
-        assert!(app.scroll_offset < 5);
+        assert!(app.scroll_offset < app.total_notebook_height());
+    }
+
+    #[test]
+    fn escape_clears_command_mode_selection() {
+        let notebook = Notebook::new("Esc").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn navigation_reselects_after_escape() {
+        let notebook =
+            Notebook::new("EscNav").with_cells(vec![Cell::markdown("one"), Cell::markdown("two")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn cell_actions_fail_cleanly_without_selection() {
+        let notebook = Notebook::new("NoSel").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        app.selected = None;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.selected, None);
+        assert_eq!(app.status, "no cell selected");
     }
 
     #[test]

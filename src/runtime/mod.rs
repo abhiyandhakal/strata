@@ -8,9 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ai::AiRuntime;
 use crate::core::{
-    ArtifactId, ArtifactRef, BridgeValue, Cell, CellKind, CellOutput, ExecutionId,
-    ExecutionRecord, ExecutionRequest, ExecutionStatus, KernelKind, Language, Notebook,
-    SessionId, SessionManifest,
+    ArtifactId, ArtifactRef, BridgeValue, Cell, CellKind, CellOutput, ExecutionId, ExecutionRecord,
+    ExecutionRequest, ExecutionStatus, KernelKind, Language, Notebook, SessionId, SessionManifest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +136,9 @@ impl SessionManager {
                         self.register_kernel(Box::new(PythonKernelAdapter::default()))?;
                     }
                     EnvironmentKind::PythonInterpreter(path) => {
-                        self.register_kernel(Box::new(PythonKernelAdapter::from_interpreter(path)))?;
+                        self.register_kernel(Box::new(PythonKernelAdapter::from_interpreter(
+                            path,
+                        )))?;
                     }
                 }
             }
@@ -196,7 +197,11 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn run_cell_at(&mut self, notebook: &mut Notebook, index: usize) -> Result<ExecutionRecord> {
+    pub fn run_cell_at(
+        &mut self,
+        notebook: &mut Notebook,
+        index: usize,
+    ) -> Result<ExecutionRecord> {
         let cell = notebook
             .cells
             .get(index)
@@ -742,7 +747,13 @@ pub fn discover_environments(
     if let Some(parent) = notebook_path.and_then(Path::parent) {
         for name in [".venv", "venv", "env"] {
             push_python(
-                format!("{} ({name})", parent.file_name().and_then(|v| v.to_str()).unwrap_or("Project")),
+                format!(
+                    "{} ({name})",
+                    parent
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("Project")
+                ),
                 parent.join(name).join("bin").join("python"),
             );
         }
@@ -992,7 +1003,7 @@ fn reconcile_manifest_with_notebook(
     manifest.ui_state.selected_cell = manifest
         .ui_state
         .selected_cell
-        .min(notebook.cells.len().saturating_sub(1));
+        .map(|selected| selected.min(notebook.cells.len().saturating_sub(1)));
     manifest
         .ui_state
         .cell_modes
@@ -1172,7 +1183,11 @@ mod tests {
 
         let (manifest, notice) = reconcile_manifest_with_notebook(&mut edited, session.manifest);
 
-        assert!(notice.unwrap().contains("invalidated stale checkpoint state"));
+        assert!(
+            notice
+                .unwrap()
+                .contains("invalidated stale checkpoint state")
+        );
         assert!(manifest.execution_history.is_empty());
         assert_eq!(edited.cells[0].execution_count, None);
         assert!(edited.cells[0].outputs.is_empty());

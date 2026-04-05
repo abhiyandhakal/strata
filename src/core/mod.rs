@@ -272,7 +272,10 @@ impl Default for NotebookMetadata {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "output_type", rename_all = "snake_case")]
 pub enum CellOutput {
-    Stream { name: String, text: String },
+    Stream {
+        name: String,
+        text: String,
+    },
     ExecuteResult {
         execution_count: u32,
         data: BTreeMap<String, Value>,
@@ -556,7 +559,8 @@ pub struct AiRunRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
-    pub selected_cell: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_cell: Option<usize>,
     pub viewport_row: usize,
     pub cell_modes: BTreeMap<String, CellUiState>,
 }
@@ -564,7 +568,7 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            selected_cell: 0,
+            selected_cell: Some(0),
             viewport_row: 0,
             cell_modes: BTreeMap::new(),
         }
