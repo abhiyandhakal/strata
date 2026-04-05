@@ -279,12 +279,12 @@ pub enum CellOutput {
     ExecuteResult {
         execution_count: u32,
         data: BTreeMap<String, Value>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default)]
         metadata: BTreeMap<String, Value>,
     },
     DisplayData {
         data: BTreeMap<String, Value>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default)]
         metadata: BTreeMap<String, Value>,
     },
     Error {

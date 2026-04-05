@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::{
-    Cell, CellId, CellKind, CellOutput, KernelKind, Kernelspec, Language, LanguageInfo,
-    Notebook, NotebookMetadata, SessionManifest,
+    Cell, CellId, CellKind, CellOutput, KernelKind, Kernelspec, Language, LanguageInfo, Notebook,
+    NotebookMetadata, SessionManifest,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,7 +78,10 @@ impl NotebookStorage {
     }
 
     pub fn render(path: Option<&Path>, notebook: &Notebook) -> String {
-        match path.map(Self::format_for_path).unwrap_or(NotebookFormat::Smd) {
+        match path
+            .map(Self::format_for_path)
+            .unwrap_or(NotebookFormat::Smd)
+        {
             NotebookFormat::Ipynb => Self::render_ipynb(notebook),
             NotebookFormat::Smd => Self::render_smd(notebook),
         }
@@ -325,7 +328,9 @@ impl NotebookStorage {
                     while index < lines.len() && lines[index].trim().is_empty() {
                         index += 1;
                     }
-                    if index >= lines.len() || !lines[index].trim_start().starts_with("<!-- strata:output") {
+                    if index >= lines.len()
+                        || !lines[index].trim_start().starts_with("<!-- strata:output")
+                    {
                         break;
                     }
                     let output_meta = parse_output_comment(lines[index].trim())?;
@@ -374,8 +379,7 @@ impl NotebookStorage {
                 .description
                 .as_ref()
                 .map(|value| format!(" description={value:?}"))
-                .unwrap_or_default()
-            ,
+                .unwrap_or_default(),
             render_kernel(notebook.metadata.runtime.kernel),
             notebook.metadata.runtime.environment
         ));
@@ -628,9 +632,9 @@ fn render_output_comment(output: &CellOutput) -> String {
                 .map(|path| format!(" path={path:?}"))
                 .unwrap_or_default()
         ),
-        CellOutput::Error { ename, evalue, .. } => format!(
-            "<!-- strata:output kind=error ename={ename:?} evalue={evalue:?} -->"
-        ),
+        CellOutput::Error { ename, evalue, .. } => {
+            format!("<!-- strata:output kind=error ename={ename:?} evalue={evalue:?} -->")
+        }
     }
 }
 
@@ -775,10 +779,7 @@ fn materialize_image_outputs(path: &Path, notebook: &mut Notebook) -> Result<()>
             };
             match image.mime.as_str() {
                 "image/svg+xml" => {
-                    fs::write(
-                        &artifact_path,
-                        data.as_str().unwrap_or_default().as_bytes(),
-                    )?;
+                    fs::write(&artifact_path, data.as_str().unwrap_or_default().as_bytes())?;
                 }
                 _ => {
                     let encoded = data.as_str().unwrap_or_default();
@@ -797,14 +798,8 @@ fn materialize_image_outputs(path: &Path, notebook: &mut Notebook) -> Result<()>
             match output {
                 CellOutput::ExecuteResult { metadata, .. }
                 | CellOutput::DisplayData { metadata, .. } => {
-                    metadata.insert(
-                        "strata_image_path".to_string(),
-                        Value::String(relative),
-                    );
-                    metadata.insert(
-                        "strata_image_mime".to_string(),
-                        Value::String(image.mime),
-                    );
+                    metadata.insert("strata_image_path".to_string(), Value::String(relative));
+                    metadata.insert("strata_image_mime".to_string(), Value::String(image.mime));
                 }
                 _ => {}
             }
@@ -851,7 +846,7 @@ enum IpynbCell {
     Markdown {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default)]
         metadata: BTreeMap<String, Value>,
         #[serde(default)]
         source: SourceField,
@@ -861,7 +856,7 @@ enum IpynbCell {
     Raw {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default)]
         metadata: BTreeMap<String, Value>,
         #[serde(default)]
         source: SourceField,
@@ -871,7 +866,7 @@ enum IpynbCell {
     Code {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default)]
         metadata: BTreeMap<String, Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         execution_count: Option<u32>,
@@ -953,8 +948,7 @@ mod tests {
             name: "stdout".to_string(),
             text: "hello\n".to_string(),
         }];
-        notebook
-            .cells[0]
+        notebook.cells[0]
             .metadata
             .insert("custom".to_string(), json!(true));
 
