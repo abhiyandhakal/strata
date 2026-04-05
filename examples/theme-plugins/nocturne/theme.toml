@@ -24,11 +24,11 @@ name = "Nocturne"
 "cell.button.delete" = { fg = "lightred", modifiers = ["bold"] }
 "cell.button.output" = { fg = "lightblue", modifiers = ["bold"] }
 "cell.title" = { fg = "white", modifiers = ["bold"] }
-"editor.cursor_line" = { modifiers = ["reversed"] }
-"editor.cursor.normal" = { modifiers = ["reversed"] }
-"editor.cursor.insert" = { fg = "lightblue", modifiers = ["reversed"] }
-"editor.cursor.visual" = { fg = "lightyellow", modifiers = ["reversed"] }
-"editor.cursor.operator" = { fg = "lightgreen", modifiers = ["reversed"] }
+"editor.cursor_line" = { bg = "#1a2030" }
+"editor.cursor.normal" = { fg = "black", bg = "lightcyan" }
+"editor.cursor.insert" = { fg = "black", bg = "lightblue" }
+"editor.cursor.visual" = { fg = "black", bg = "lightyellow" }
+"editor.cursor.operator" = { fg = "black", bg = "lightgreen" }
 "markdown.heading1" = { fg = "lightyellow", modifiers = ["bold"] }
 "markdown.heading2" = { fg = "lightcyan", modifiers = ["bold"] }
 "output.block" = { fg = "white", bg = "#08111c" }
