@@ -62,22 +62,31 @@ fn open_or_run_command(path: PathBuf) -> Result<()> {
     }
     let config = StrataConfig::load()?;
     let mut notebook = NotebookStorage::load(&path)?;
-    let mut session = load_session_for_notebook(&path, &notebook)?;
+    let (mut session, reconcile_notice) = load_session_for_notebook(&path, &mut notebook)?;
 
     if should_launch_tui() {
         let resolution =
             ThemeResolver::from_env().resolve(config.theme.path.as_deref(), Some(&path));
+        let startup_notice = match (resolution.warning, reconcile_notice) {
+            (Some(theme), Some(reconcile)) => Some(format!("{theme}; {reconcile}")),
+            (Some(theme), None) => Some(theme),
+            (None, Some(reconcile)) => Some(reconcile),
+            (None, None) => None,
+        };
         App::new(
             notebook,
             Some(path),
             session,
             config.editor.vim_mode,
             resolution.theme,
-            resolution.warning,
+            startup_notice,
         )
         .run()?;
     } else {
         let checkpoint_paths = CheckpointPaths::for_notebook(&path);
+        if let Some(notice) = reconcile_notice {
+            println!("{notice}");
+        }
         let records = run_notebook_cells(&mut session, &mut notebook)
             .with_context(|| format!("failed to execute notebook {}", path.display()))?;
         CheckpointStorage::save(&checkpoint_paths, &session.manifest)?;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -758,17 +758,21 @@ fn apply_bridges(named_values: &mut BTreeMap<String, String>, bridges: &[BridgeV
     }
 }
 
-pub fn load_session_for_notebook(path: &Path, notebook: &Notebook) -> Result<SessionManager> {
+pub fn load_session_for_notebook(
+    path: &Path,
+    notebook: &mut Notebook,
+) -> Result<(SessionManager, Option<String>)> {
     let checkpoint_paths = crate::storage::CheckpointPaths::for_notebook(path);
-    let manifest = if crate::storage::CheckpointStorage::exists(&checkpoint_paths) {
-        crate::storage::CheckpointStorage::load(&checkpoint_paths)?
+    let (manifest, notice) = if crate::storage::CheckpointStorage::exists(&checkpoint_paths) {
+        let manifest = crate::storage::CheckpointStorage::load(&checkpoint_paths)?;
+        reconcile_manifest_with_notebook(notebook, manifest)
     } else {
-        SessionManifest::new(notebook)
+        (SessionManifest::new(notebook), None)
     };
     let mut session =
         SessionManager::from_manifest(manifest).with_ai_runtime(AiRuntime::from_env()?);
     session.configure_for_notebook(notebook, Some(path))?;
-    Ok(session)
+    Ok((session, notice))
 }
 
 pub fn run_notebook_cells(
@@ -897,6 +901,141 @@ fn apply_record_to_notebook(notebook: &mut Notebook, index: usize, record: &Exec
     cell.outputs = record.outputs.clone();
 }
 
+fn reconcile_manifest_with_notebook(
+    notebook: &mut Notebook,
+    manifest: SessionManifest,
+) -> (SessionManifest, Option<String>) {
+    let mut manifest = manifest;
+    let cell_index_by_id: HashMap<String, usize> = notebook
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (cell.id.0.clone(), index))
+        .collect();
+    let latest_matching_record_by_cell: HashMap<String, ExecutionRecord> = manifest
+        .execution_history
+        .iter()
+        .rev()
+        .filter_map(|record| {
+            let cell = cell_index_by_id
+                .get(&record.cell_id.0)
+                .and_then(|index| notebook.cells.get(*index))?;
+            if record_matches_cell(record, cell) {
+                Some((record.cell_id.0.clone(), record.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut broken_languages: HashSet<Language> = HashSet::new();
+    let mut valid_record_ids = std::collections::BTreeSet::new();
+    let mut invalidated_cells = 0usize;
+
+    for cell in &mut notebook.cells {
+        let should_track_runtime = matches!(cell.kind, CellKind::Code | CellKind::Ai);
+        if !should_track_runtime {
+            continue;
+        }
+
+        let record = latest_matching_record_by_cell.get(&cell.id.0).cloned();
+        let language_broken = broken_languages.contains(&cell.language);
+        if language_broken || record.is_none() {
+            if record.is_none() {
+                invalidated_cells += 1;
+            }
+            if matches!(cell.kind, CellKind::Code) {
+                broken_languages.insert(cell.language);
+            }
+            clear_cell_runtime_state(cell);
+            continue;
+        }
+
+        let record = record.expect("record checked above");
+        valid_record_ids.insert(record.id.0.clone());
+        cell.execution_count = record.execution_count;
+        cell.outputs = record.outputs.clone();
+    }
+
+    manifest.execution_history.retain(|record| {
+        valid_record_ids.contains(&record.id.0) && cell_index_by_id.contains_key(&record.cell_id.0)
+    });
+    manifest.ai_history.retain(|run| {
+        cell_index_by_id.contains_key(&run.prompt_cell_id)
+            && notebook
+                .cells
+                .iter()
+                .find(|cell| cell.id.0 == run.prompt_cell_id)
+                .map(|cell| cell.kind == CellKind::Ai && cell.source == run.prompt)
+                .unwrap_or(false)
+    });
+
+    let mut named_values = BTreeMap::new();
+    let mut artifacts = Vec::new();
+    let mut next_execution_count = 1u32;
+    for cell in &notebook.cells {
+        if let Some(record) = manifest
+            .execution_history
+            .iter()
+            .find(|record| record.cell_id == cell.id)
+        {
+            apply_bridges(&mut named_values, &record.bridges);
+            artifacts.extend(record.dependencies.clone());
+            if let Some(count) = record.execution_count {
+                next_execution_count = next_execution_count.max(count + 1);
+            }
+        }
+    }
+    manifest.named_values = named_values;
+    manifest.artifacts = artifacts;
+    manifest.next_execution_count = next_execution_count;
+    manifest.ui_state.selected_cell = manifest
+        .ui_state
+        .selected_cell
+        .min(notebook.cells.len().saturating_sub(1));
+    manifest
+        .ui_state
+        .cell_modes
+        .retain(|cell_id, _| cell_index_by_id.contains_key(cell_id));
+
+    let total_current_cells = notebook
+        .cells
+        .iter()
+        .filter(|cell| matches!(cell.kind, CellKind::Code | CellKind::Ai))
+        .count();
+    let valid_cells = notebook
+        .cells
+        .iter()
+        .filter(|cell| {
+            matches!(cell.kind, CellKind::Code | CellKind::Ai)
+                && manifest
+                    .execution_history
+                    .iter()
+                    .any(|record| record.cell_id == cell.id)
+        })
+        .count();
+    let dropped = total_current_cells.saturating_sub(valid_cells);
+    let notice = if dropped > 0 || invalidated_cells > 0 {
+        Some(format!(
+            "notebook changed outside Strata; invalidated stale checkpoint state for {} cells",
+            dropped.max(invalidated_cells)
+        ))
+    } else {
+        None
+    };
+
+    (manifest, notice)
+}
+
+fn record_matches_cell(record: &ExecutionRecord, cell: &Cell) -> bool {
+    record.cell_id == cell.id && record.language == cell.language && record.source == cell.source
+}
+
+fn clear_cell_runtime_state(cell: &mut Cell) {
+    cell.execution_count = None;
+    cell.outputs.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,5 +1141,65 @@ mod tests {
         let record = second.run_code_cell(&notebook.cells[1]).unwrap();
 
         assert_eq!(record.output, "42");
+    }
+
+    #[test]
+    fn reconciliation_invalidates_changed_cells_and_downstream_language_state() {
+        let original = Notebook::new("Changed").with_cells(vec![
+            Cell::code(Language::Python, "value = 42"),
+            Cell::code(Language::Python, "print(value)"),
+        ]);
+        let mut session = SessionManager::new(&original);
+        session
+            .register_kernel(Box::new(PythonKernelAdapter::default()))
+            .unwrap();
+        let first = session.run_code_cell(&original.cells[0]).unwrap();
+        let second = session.run_code_cell(&original.cells[1]).unwrap();
+        assert_eq!(second.output, "42");
+
+        let mut edited = original.clone();
+        edited.cells[0].source = "value = 7".to_string();
+        edited.cells[0].execution_count = Some(99);
+        edited.cells[0].outputs = vec![CellOutput::Stream {
+            name: "stdout".to_string(),
+            text: "stale".to_string(),
+        }];
+        edited.cells[1].execution_count = Some(99);
+        edited.cells[1].outputs = vec![CellOutput::Stream {
+            name: "stdout".to_string(),
+            text: "stale".to_string(),
+        }];
+
+        let (manifest, notice) = reconcile_manifest_with_notebook(&mut edited, session.manifest);
+
+        assert!(notice.unwrap().contains("invalidated stale checkpoint state"));
+        assert!(manifest.execution_history.is_empty());
+        assert_eq!(edited.cells[0].execution_count, None);
+        assert!(edited.cells[0].outputs.is_empty());
+        assert_eq!(edited.cells[1].execution_count, None);
+        assert!(edited.cells[1].outputs.is_empty());
+        let _ = first;
+    }
+
+    #[test]
+    fn reconciliation_keeps_matching_unchanged_cells() {
+        let notebook = Notebook::new("Keep").with_cells(vec![
+            Cell::code(Language::Python, "value = 42"),
+            Cell::code(Language::Python, "print(value)"),
+        ]);
+        let mut session = SessionManager::new(&notebook);
+        session
+            .register_kernel(Box::new(PythonKernelAdapter::default()))
+            .unwrap();
+        session.run_code_cell(&notebook.cells[0]).unwrap();
+        let second = session.run_code_cell(&notebook.cells[1]).unwrap();
+
+        let mut reopened = notebook.clone();
+        let (manifest, notice) = reconcile_manifest_with_notebook(&mut reopened, session.manifest);
+
+        assert!(notice.is_none());
+        assert_eq!(manifest.execution_history.len(), 2);
+        assert_eq!(reopened.cells[1].execution_count, second.execution_count);
+        assert_eq!(reopened.cells[1].outputs, second.outputs);
     }
 }
