@@ -126,7 +126,11 @@ impl ThemeResolver {
         Self { user_plugin_root }
     }
 
-    pub fn resolve(&self, configured_path: Option<&str>, notebook_path: Option<&Path>) -> ThemeResolution {
+    pub fn resolve(
+        &self,
+        configured_path: Option<&str>,
+        notebook_path: Option<&Path>,
+    ) -> ThemeResolution {
         match configured_path {
             None => ThemeResolution {
                 theme: Theme::default_theme(),
@@ -153,7 +157,10 @@ impl ThemeResolver {
             .iter()
             .any(|capability| capability.capability() == PluginCapability::Theme)
         {
-            bail!("plugin {} does not declare theme capability", plugin.manifest.id);
+            bail!(
+                "plugin {} does not declare theme capability",
+                plugin.manifest.id
+            );
         }
         let theme_ref = plugin
             .manifest
@@ -166,13 +173,19 @@ impl ThemeResolver {
         let spec = toml::from_str::<ThemeSpec>(&body)
             .with_context(|| format!("failed to parse theme spec {}", spec_path.display()))?;
         Theme::compile(
-            spec.name.clone().unwrap_or_else(|| plugin.manifest.name.clone()),
+            spec.name
+                .clone()
+                .unwrap_or_else(|| plugin.manifest.name.clone()),
             plugin.source,
             &spec,
         )
     }
 
-    fn load_plugin(&self, configured_path: &str, notebook_path: Option<&Path>) -> Result<DiscoveredPlugin> {
+    fn load_plugin(
+        &self,
+        configured_path: &str,
+        notebook_path: Option<&Path>,
+    ) -> Result<DiscoveredPlugin> {
         let candidate_roots = self.candidate_paths(configured_path, notebook_path);
         for candidate in candidate_roots {
             if let Some(plugin) = load_plugin_candidate(&candidate)? {
@@ -192,7 +205,12 @@ impl ThemeResolver {
 
         if let Some(notebook_dir) = notebook_path.and_then(Path::parent) {
             paths.push(notebook_dir.join(&configured));
-            paths.push(notebook_dir.join(".strata").join("plugins").join(&configured));
+            paths.push(
+                notebook_dir
+                    .join(".strata")
+                    .join("plugins")
+                    .join(&configured),
+            );
         }
         if let Some(user_root) = &self.user_plugin_root {
             paths.push(user_root.join(&configured));
@@ -224,7 +242,10 @@ fn load_plugin_candidate(candidate: &Path) -> Result<Option<DiscoveredPlugin>> {
         if !manifest_path.exists() {
             return Ok(None);
         }
-        let source = if candidate.components().any(|part| part.as_os_str() == ".strata") {
+        let source = if candidate
+            .components()
+            .any(|part| part.as_os_str() == ".strata")
+        {
             PluginSource::NotebookDir(candidate.to_path_buf())
         } else {
             PluginSource::UserDir(candidate.to_path_buf())
@@ -237,8 +258,12 @@ fn load_plugin_candidate(candidate: &Path) -> Result<Option<DiscoveredPlugin>> {
     }
     let body = fs::read_to_string(&manifest_path)
         .with_context(|| format!("failed to read plugin manifest {}", manifest_path.display()))?;
-    let manifest = toml::from_str::<PluginManifest>(&body)
-        .with_context(|| format!("failed to parse plugin manifest {}", manifest_path.display()))?;
+    let manifest = toml::from_str::<PluginManifest>(&body).with_context(|| {
+        format!(
+            "failed to parse plugin manifest {}",
+            manifest_path.display()
+        )
+    })?;
     Ok(Some(DiscoveredPlugin {
         root,
         source,
@@ -273,62 +298,57 @@ impl Theme {
             styles.insert(key.clone(), compile_recipe(recipe)?);
         }
 
-        let mut syntax = BTreeMap::from([
-            (
-                SyntaxTokenKind::Comment,
-                compile_recipe(
-                    spec.syntax
-                        .comment
-                        .as_ref()
-                        .unwrap_or(&recipe("darkgray", None, &[])),
-                )?,
-            ),
-            (
-                SyntaxTokenKind::String,
-                compile_recipe(
-                    spec.syntax
-                        .string
-                        .as_ref()
-                        .unwrap_or(&recipe("green", None, &[])),
-                )?,
-            ),
-            (
-                SyntaxTokenKind::Number,
-                compile_recipe(
-                    spec.syntax
-                        .number
-                        .as_ref()
-                        .unwrap_or(&recipe("cyan", None, &[])),
-                )?,
-            ),
-            (
-                SyntaxTokenKind::TypeName,
-                compile_recipe(
-                    spec.syntax
-                        .type_name
-                        .as_ref()
-                        .unwrap_or(&recipe("yellow", None, &[])),
-                )?,
-            ),
-            (
-                SyntaxTokenKind::Keyword,
-                compile_recipe(
-                    spec.syntax
-                        .keyword
-                        .as_ref()
-                        .unwrap_or(&recipe("magenta", None, &["bold"])),
-                )?,
-            ),
-            (
-                SyntaxTokenKind::Identifier,
-                compile_recipe(
-                    spec.syntax
-                        .identifier
-                        .as_ref()
-                        .unwrap_or(&recipe("lightblue", None, &[])),
-                )?,
-            ),
-        ]);
+        let mut syntax =
+            BTreeMap::from([
+                (
+                    SyntaxTokenKind::Comment,
+                    compile_recipe(spec.syntax.comment.as_ref().unwrap_or(&recipe(
+                        "darkgray",
+                        None,
+                        &[],
+                    )))?,
+                ),
+                (
+                    SyntaxTokenKind::String,
+                    compile_recipe(spec.syntax.string.as_ref().unwrap_or(&recipe(
+                        "green",
+                        None,
+                        &[],
+                    )))?,
+                ),
+                (
+                    SyntaxTokenKind::Number,
+                    compile_recipe(spec.syntax.number.as_ref().unwrap_or(&recipe(
+                        "cyan",
+                        None,
+                        &[],
+                    )))?,
+                ),
+                (
+                    SyntaxTokenKind::TypeName,
+                    compile_recipe(spec.syntax.type_name.as_ref().unwrap_or(&recipe(
+                        "yellow",
+                        None,
+                        &[],
+                    )))?,
+                ),
+                (
+                    SyntaxTokenKind::Keyword,
+                    compile_recipe(spec.syntax.keyword.as_ref().unwrap_or(&recipe(
+                        "magenta",
+                        None,
+                        &["bold"],
+                    )))?,
+                ),
+                (
+                    SyntaxTokenKind::Identifier,
+                    compile_recipe(spec.syntax.identifier.as_ref().unwrap_or(&recipe(
+                        "lightblue",
+                        None,
+                        &[],
+                    )))?,
+                ),
+            ]);
 
         if let Some(base) = styles.get("text.default").copied() {
             syntax.entry(SyntaxTokenKind::Identifier).or_insert(base);
@@ -371,25 +391,73 @@ fn default_style_recipes() -> BTreeMap<String, ThemeRecipe> {
         ("text.default".to_string(), recipe("white", None, &[])),
         ("status.title".to_string(), recipe("white", None, &["bold"])),
         ("status.body".to_string(), recipe("gray", None, &[])),
-        ("toolbar.block".to_string(), recipe("white", Some("#0b1020"), &[])),
-        ("toolbar.border".to_string(), recipe("lightcyan", None, &["bold"])),
-        ("toolbar.button.save".to_string(), recipe("yellow", None, &["bold"])),
-        ("toolbar.button.run_all".to_string(), recipe("green", None, &["bold"])),
-        ("toolbar.button.restart".to_string(), recipe("red", None, &["bold"])),
-        ("toolbar.button.add_code".to_string(), recipe("cyan", None, &["bold"])),
-        ("toolbar.button.add_markdown".to_string(), recipe("blue", None, &["bold"])),
+        (
+            "toolbar.block".to_string(),
+            recipe("white", Some("#0b1020"), &[]),
+        ),
+        (
+            "toolbar.border".to_string(),
+            recipe("lightcyan", None, &["bold"]),
+        ),
+        (
+            "toolbar.button.save".to_string(),
+            recipe("yellow", None, &["bold"]),
+        ),
+        (
+            "toolbar.button.run_all".to_string(),
+            recipe("green", None, &["bold"]),
+        ),
+        (
+            "toolbar.button.restart".to_string(),
+            recipe("red", None, &["bold"]),
+        ),
+        (
+            "toolbar.button.add_code".to_string(),
+            recipe("cyan", None, &["bold"]),
+        ),
+        (
+            "toolbar.button.add_markdown".to_string(),
+            recipe("blue", None, &["bold"]),
+        ),
         ("notebook.empty".to_string(), recipe("gray", None, &[])),
-        ("cell.shell".to_string(), recipe("white", Some("#0a0e14"), &[])),
-        ("cell.shell.selected".to_string(), recipe("white", Some("#14222e"), &[])),
+        (
+            "cell.shell".to_string(),
+            recipe("white", Some("#0a0e14"), &[]),
+        ),
+        (
+            "cell.shell.selected".to_string(),
+            recipe("white", Some("#14222e"), &[]),
+        ),
         ("cell.border".to_string(), recipe("darkgray", None, &[])),
-        ("cell.border.selected".to_string(), recipe("lightcyan", None, &["bold"])),
+        (
+            "cell.border.selected".to_string(),
+            recipe("lightcyan", None, &["bold"]),
+        ),
         ("cell.prompt".to_string(), recipe("gray", None, &[])),
-        ("cell.prompt.selected".to_string(), recipe("black", Some("lightcyan"), &["bold"])),
-        ("cell.button.run".to_string(), recipe("green", None, &["bold"])),
-        ("cell.button.edit".to_string(), recipe("yellow", None, &["bold"])),
-        ("cell.button.add".to_string(), recipe("cyan", None, &["bold"])),
-        ("cell.button.delete".to_string(), recipe("red", None, &["bold"])),
-        ("cell.button.output".to_string(), recipe("blue", None, &["bold"])),
+        (
+            "cell.prompt.selected".to_string(),
+            recipe("black", Some("lightcyan"), &["bold"]),
+        ),
+        (
+            "cell.button.run".to_string(),
+            recipe("green", None, &["bold"]),
+        ),
+        (
+            "cell.button.edit".to_string(),
+            recipe("yellow", None, &["bold"]),
+        ),
+        (
+            "cell.button.add".to_string(),
+            recipe("cyan", None, &["bold"]),
+        ),
+        (
+            "cell.button.delete".to_string(),
+            recipe("red", None, &["bold"]),
+        ),
+        (
+            "cell.button.output".to_string(),
+            recipe("blue", None, &["bold"]),
+        ),
         ("cell.title".to_string(), recipe("white", None, &["bold"])),
         (
             "editor.cursor_line".to_string(),
@@ -399,8 +467,14 @@ fn default_style_recipes() -> BTreeMap<String, ThemeRecipe> {
                 modifiers: Vec::new(),
             },
         ),
-        ("editor.cursor.normal".to_string(), recipe("black", Some("lightcyan"), &[])),
-        ("editor.cursor.insert".to_string(), recipe("black", Some("lightblue"), &[])),
+        (
+            "editor.cursor.normal".to_string(),
+            recipe("black", Some("lightcyan"), &[]),
+        ),
+        (
+            "editor.cursor.insert".to_string(),
+            recipe("black", Some("lightblue"), &[]),
+        ),
         (
             "editor.cursor.visual".to_string(),
             recipe("black", Some("lightyellow"), &[]),
@@ -409,14 +483,43 @@ fn default_style_recipes() -> BTreeMap<String, ThemeRecipe> {
             "editor.cursor.operator".to_string(),
             recipe("black", Some("lightgreen"), &[]),
         ),
-        ("markdown.heading1".to_string(), recipe("yellow", None, &["bold"])),
-        ("markdown.heading2".to_string(), recipe("cyan", None, &["bold"])),
-        ("output.block".to_string(), recipe("white", Some("#0e1520"), &[])),
+        (
+            "markdown.heading1".to_string(),
+            recipe("yellow", None, &["bold"]),
+        ),
+        (
+            "markdown.heading2".to_string(),
+            recipe("cyan", None, &["bold"]),
+        ),
+        (
+            "markdown.image.link".to_string(),
+            recipe("lightcyan", None, &["underlined"]),
+        ),
+        (
+            "markdown.image.missing".to_string(),
+            recipe("gray", None, &[]),
+        ),
+        (
+            "output.block".to_string(),
+            recipe("white", Some("#0e1520"), &[]),
+        ),
         ("output.border".to_string(), recipe("darkgray", None, &[])),
-        ("output.stream.label".to_string(), recipe("blue", None, &["bold"])),
-        ("output.result.label".to_string(), recipe("green", None, &["bold"])),
-        ("output.error.label".to_string(), recipe("red", None, &["bold"])),
-        ("output.error.trace".to_string(), recipe("lightred", None, &[])),
+        (
+            "output.stream.label".to_string(),
+            recipe("blue", None, &["bold"]),
+        ),
+        (
+            "output.result.label".to_string(),
+            recipe("green", None, &["bold"]),
+        ),
+        (
+            "output.error.label".to_string(),
+            recipe("red", None, &["bold"]),
+        ),
+        (
+            "output.error.trace".to_string(),
+            recipe("lightred", None, &[]),
+        ),
         ("lsp.active".to_string(), recipe("green", None, &["bold"])),
         ("lsp.available".to_string(), recipe("cyan", None, &["bold"])),
         ("lsp.unavailable".to_string(), recipe("yellow", None, &[])),
@@ -537,7 +640,9 @@ name = "Ocean"
         assert_eq!(resolution.theme.name(), "Ocean");
         assert_eq!(
             resolution.theme.style("cell.border.selected"),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         );
     }
 

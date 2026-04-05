@@ -2,6 +2,7 @@ pub mod ai;
 pub mod clipboard;
 pub mod config;
 pub mod core;
+pub mod media;
 pub mod runtime;
 pub mod storage;
 pub mod theme;

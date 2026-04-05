@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,11 +19,16 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 use crate::clipboard::{Clipboard, ClipboardResult};
 use crate::core::{
     Cell, CellKind, CellOutput, CellUiState, ExecutionStatus, KernelKind, Language, Notebook,
+};
+use crate::media::{
+    TerminalImageSupport, load_markdown_image, markdown_image_alt, resolve_markdown_image_path,
+    validate_markdown_image_path,
 };
 use crate::runtime::{EnvironmentOption, SessionManager, discover_environments};
 use crate::storage::{CheckpointPaths, CheckpointStorage, NotebookStorage};
@@ -441,6 +446,7 @@ enum HitTarget {
     CellToggleRender(usize),
     CellToggleOutput(usize),
     CellOpenImage(usize),
+    MarkdownImageOpen(usize, usize, usize),
     CellInsertBelow(usize),
     CellDelete(usize),
 }
@@ -470,6 +476,45 @@ struct MouseTextSelection {
     target: CopyTarget,
     anchor: TextPoint,
     focus: TextPoint,
+}
+
+#[derive(Clone, Debug)]
+enum MarkdownBlock {
+    Text {
+        line: Line<'static>,
+        plain: String,
+        links: Vec<MarkdownLinkSpan>,
+    },
+    Image {
+        alt: String,
+        plain: String,
+        path: Option<PathBuf>,
+        missing: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct MarkdownLinkSpan {
+    start_col: usize,
+    width: usize,
+    path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct RenderedMarkdown {
+    blocks: Vec<MarkdownBlock>,
+}
+
+impl RenderedMarkdown {
+    fn plain_lines(&self) -> Vec<String> {
+        self.blocks
+            .iter()
+            .map(|block| match block {
+                MarkdownBlock::Text { plain, .. } => plain.clone(),
+                MarkdownBlock::Image { plain, .. } => plain.clone(),
+            })
+            .collect()
+    }
 }
 
 impl MouseTextSelection {
@@ -516,6 +561,8 @@ pub struct App {
     command_prefix: Option<char>,
     clipboard: Clipboard,
     mouse_text_selection: Option<MouseTextSelection>,
+    terminal_images: Option<TerminalImageSupport>,
+    markdown_image_cache: BTreeMap<PathBuf, StatefulProtocol>,
 }
 
 impl App {
@@ -553,11 +600,13 @@ impl App {
 
         let mut cell_modes = session.manifest.ui_state.cell_modes.clone();
         for cell in &notebook.cells {
-            cell_modes.entry(cell.id.0.clone()).or_insert_with(|| CellUiState {
-                rendered: cell.kind == CellKind::Markdown,
-                body_collapsed: false,
-                output_collapsed: false,
-            });
+            cell_modes
+                .entry(cell.id.0.clone())
+                .or_insert_with(|| CellUiState {
+                    rendered: cell.kind == CellKind::Markdown,
+                    body_collapsed: false,
+                    output_collapsed: false,
+                });
         }
 
         let selected = usize::min(
@@ -593,6 +642,8 @@ impl App {
             command_prefix: None,
             clipboard,
             mouse_text_selection: None,
+            terminal_images: None,
+            markdown_image_cache: BTreeMap::new(),
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
@@ -610,6 +661,15 @@ impl App {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+        match TerminalImageSupport::detect() {
+            Ok(support) => {
+                self.terminal_images = support;
+            }
+            Err(error) => {
+                self.terminal_images = None;
+                self.status = format!("inline image detection failed: {error}");
+            }
+        }
 
         let loop_result = self.event_loop(&mut terminal);
 
@@ -651,7 +711,7 @@ impl App {
             KeyCode::Char('e') | KeyCode::Enter => self.enter_edit_mode(),
             KeyCode::Char('K') => self.cycle_kernel()?,
             KeyCode::Char('E') => self.cycle_environment()?,
-            KeyCode::Char('x') => self.open_selected_image()?,
+            KeyCode::Char('x') => self.open_selected_visual()?,
             KeyCode::Char('r') => self.run_selected_cell()?,
             KeyCode::Char('R') => self.run_all_cells()?,
             KeyCode::Char('y') => self.copy_current_target()?,
@@ -840,7 +900,8 @@ impl App {
                 if let Some(region) = self.content_region_at(mouse.column, mouse.row).cloned() {
                     let point = text_point_from_mouse(&region, mouse.column, mouse.row, self);
                     if let Some(selection) = self.mouse_text_selection.as_mut() {
-                        if selection.cell_index == region.cell_index && selection.target == region.target
+                        if selection.cell_index == region.cell_index
+                            && selection.target == region.target
                         {
                             selection.focus = point;
                         }
@@ -907,7 +968,6 @@ impl App {
                     .title(Line::styled("Status", self.theme.style("status.title"))),
             );
         frame.render_widget(status, chunks[2]);
-
     }
 
     fn draw_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -955,7 +1015,10 @@ impl App {
             Span::raw(" "),
             Span::styled("[+ Code]", self.theme.style("toolbar.button.add_code")),
             Span::raw(" "),
-            Span::styled("[+ Markdown]", self.theme.style("toolbar.button.add_markdown")),
+            Span::styled(
+                "[+ Markdown]",
+                self.theme.style("toolbar.button.add_markdown"),
+            ),
         ];
         let toolbar = Paragraph::new(Line::from(std::mem::take(&mut spans)));
         frame.render_widget(toolbar, inner);
@@ -1001,13 +1064,13 @@ impl App {
         }
 
         let mut cursor_y = area.y;
-        let start = usize::min(self.scroll_offset as usize, self.notebook.cells.len().saturating_sub(1));
+        let start = usize::min(
+            self.scroll_offset as usize,
+            self.notebook.cells.len().saturating_sub(1),
+        );
         for index in start..self.notebook.cells.len() {
             let cell = self.notebook.cells[index].clone();
-            let remaining = area
-                .y
-                .saturating_add(area.height)
-                .saturating_sub(cursor_y);
+            let remaining = area.y.saturating_add(area.height).saturating_sub(cursor_y);
             if remaining < 4 {
                 break;
             }
@@ -1062,7 +1125,11 @@ impl App {
             self.theme.style("cell.prompt")
         };
         let prompt = match cell.kind {
-            CellKind::Code => format!("In [{}]:", cell.execution_count.map_or(" ".to_string(), |n| n.to_string())),
+            CellKind::Code => format!(
+                "In [{}]:",
+                cell.execution_count
+                    .map_or(" ".to_string(), |n| n.to_string())
+            ),
             CellKind::Markdown => "[Markdown]".to_string(),
             CellKind::Raw => "[Raw]".to_string(),
             CellKind::Ai => "[AI]".to_string(),
@@ -1074,13 +1141,20 @@ impl App {
             chrome_spans.push(Span::styled("[Run]", self.theme.style("cell.button.run")));
             chrome_spans.push(Span::raw(" "));
         } else if matches!(cell.kind, CellKind::Code) {
-            chrome_spans.push(Span::styled("[Unsupported]", self.theme.style("output.error.label")));
+            chrome_spans.push(Span::styled(
+                "[Unsupported]",
+                self.theme.style("output.error.label"),
+            ));
             chrome_spans.push(Span::raw(" "));
         }
         chrome_spans.push(Span::styled(
             match cell.kind {
                 CellKind::Markdown => {
-                    if rendered { "[Edit]" } else { "[Render]" }
+                    if rendered {
+                        "[Edit]"
+                    } else {
+                        "[Render]"
+                    }
                 }
                 _ => "[Edit]",
             },
@@ -1094,7 +1168,10 @@ impl App {
             self.theme.style("cell.button.edit"),
         ));
         chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled("[Del]", self.theme.style("cell.button.delete")));
+        chrome_spans.push(Span::styled(
+            "[Del]",
+            self.theme.style("cell.button.delete"),
+        ));
         if !cell.outputs.is_empty() {
             chrome_spans.push(Span::raw(" "));
             chrome_spans.push(Span::styled(
@@ -1107,7 +1184,10 @@ impl App {
             ));
             if self.first_image_output(cell).is_some() {
                 chrome_spans.push(Span::raw(" "));
-                chrome_spans.push(Span::styled("[Open]", self.theme.style("toolbar.button.add_markdown")));
+                chrome_spans.push(Span::styled(
+                    "[Open]",
+                    self.theme.style("toolbar.button.add_markdown"),
+                ));
             }
         }
         let chrome = Line::from(chrome_spans);
@@ -1159,7 +1239,10 @@ impl App {
                     .title(format!("{title} (collapsed)")),
             );
             frame.render_widget(collapsed, input_area);
-        } else if selected && self.mode == AppMode::Edit && (!rendered || cell.kind == CellKind::Code) {
+        } else if selected
+            && self.mode == AppMode::Edit
+            && (!rendered || cell.kind == CellKind::Code)
+        {
             self.sync_editor_presentation();
             if cell.kind == CellKind::Code {
                 self.render_code_editor(frame, input_area, inner_input, &title, cell);
@@ -1169,10 +1252,14 @@ impl App {
                 frame.render_widget(&self.editor, input_area);
             }
             self.active_editor_rect = Some(inner_input);
-            self.hit_regions.push(HitRegion { rect: input_area, target: HitTarget::CellEditor(index) });
+            self.hit_regions.push(HitRegion {
+                rect: input_area,
+                target: HitTarget::CellEditor(index),
+            });
+        } else if cell.kind == CellKind::Markdown && rendered {
+            self.render_markdown_cell(frame, input_area, index, cell, shell_style, border_style);
         } else {
             let content = match cell.kind {
-                CellKind::Markdown if rendered => render_markdown_block(&cell.source, &self.theme),
                 CellKind::Code => render_code_block(cell, &self.theme),
                 _ => Text::from(cell.source.clone()),
             };
@@ -1186,15 +1273,13 @@ impl App {
             } else {
                 content
             };
-            let block = Paragraph::new(content)
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(border_style)
-                        .style(shell_style)
-                        .title(title),
-                );
+            let block = Paragraph::new(content).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .style(shell_style)
+                    .title(title),
+            );
             frame.render_widget(block, input_area);
             self.hit_regions.push(HitRegion {
                 rect: input_area,
@@ -1310,8 +1395,10 @@ impl App {
         self.notebook
             .cells
             .insert(next, Cell::code(Language::Python, String::new()));
-        self.cell_modes
-            .insert(self.notebook.cells[next].id.0.clone(), CellUiState::default());
+        self.cell_modes.insert(
+            self.notebook.cells[next].id.0.clone(),
+            CellUiState::default(),
+        );
         self.selected = next;
         self.copy_target = CopyTarget::CellBody;
         self.enter_edit_mode();
@@ -1320,7 +1407,9 @@ impl App {
 
     fn insert_markdown_cell(&mut self) {
         let next = usize::min(self.selected.saturating_add(1), self.notebook.cells.len());
-        self.notebook.cells.insert(next, Cell::markdown(String::new()));
+        self.notebook
+            .cells
+            .insert(next, Cell::markdown(String::new()));
         self.cell_modes.insert(
             self.notebook.cells[next].id.0.clone(),
             CellUiState {
@@ -1396,7 +1485,9 @@ impl App {
                 return Ok(());
             }
         }
-        let record = self.session.run_cell_at(&mut self.notebook, self.selected)?;
+        let record = self
+            .session
+            .run_cell_at(&mut self.notebook, self.selected)?;
         self.save_checkpoint_only()?;
         self.status = format!(
             "ran {} -> {:?} (exit {})",
@@ -1436,7 +1527,8 @@ impl App {
             KernelKind::JavaScript => KernelKind::Python,
         };
         self.notebook.metadata.kernelspec = self.notebook.metadata.runtime.kernel.kernelspec();
-        self.notebook.metadata.language_info = self.notebook.metadata.runtime.kernel.language_info();
+        self.notebook.metadata.language_info =
+            self.notebook.metadata.runtime.kernel.language_info();
         if self.notebook.metadata.runtime.kernel != KernelKind::Python
             && self.notebook.metadata.runtime.environment != "none"
         {
@@ -1480,7 +1572,10 @@ impl App {
         self.copy_target = CopyTarget::CellBody;
         self.clear_mouse_text_selection();
         if let Some(cell) = self.notebook.cells.get(self.selected) {
-            self.cell_modes.entry(cell.id.0.clone()).or_default().body_collapsed = false;
+            self.cell_modes
+                .entry(cell.id.0.clone())
+                .or_default()
+                .body_collapsed = false;
             if cell.kind == CellKind::Markdown {
                 self.cell_modes
                     .entry(cell.id.0.clone())
@@ -1677,7 +1772,12 @@ impl App {
             HitTarget::CellOpenImage(index) => {
                 self.selected = index;
                 self.copy_target = CopyTarget::CellOutput;
-                self.open_selected_image()?;
+                self.open_selected_visual()?;
+            }
+            HitTarget::MarkdownImageOpen(index, block_index, link_index) => {
+                self.selected = index;
+                self.copy_target = CopyTarget::CellBody;
+                self.open_markdown_image(index, block_index, link_index)?;
             }
             HitTarget::CellInsertBelow(index) => {
                 self.selected = index;
@@ -1707,12 +1807,19 @@ impl App {
         } else if !selecting {
             self.editor.cancel_selection();
         }
-        self.editor.move_cursor(CursorMove::Jump(local_row, local_col));
+        self.editor
+            .move_cursor(CursorMove::Jump(local_row, local_col));
         self.sync_editor_row_offset(rect.height as usize);
         self.sync_editor_presentation();
     }
 
-    fn register_cell_chrome_hits(&mut self, chrome_area: Rect, index: usize, cell: &Cell, rendered: bool) {
+    fn register_cell_chrome_hits(
+        &mut self,
+        chrome_area: Rect,
+        index: usize,
+        cell: &Cell,
+        rendered: bool,
+    ) {
         let mut labels = Vec::new();
         if self.is_cell_runnable(cell) {
             labels.push(("[Run]", HitTarget::CellRun(index)));
@@ -1720,7 +1827,11 @@ impl App {
         labels.push((
             match cell.kind {
                 CellKind::Markdown => {
-                    if rendered { "[Edit]" } else { "[Render]" }
+                    if rendered {
+                        "[Edit]"
+                    } else {
+                        "[Render]"
+                    }
                 }
                 _ => "[Edit]",
             },
@@ -1795,12 +1906,34 @@ impl App {
         if self.cell_mode(cell).body_collapsed {
             return 3;
         }
+        if cell.kind == CellKind::Markdown && self.cell_mode(cell).rendered {
+            return self.markdown_rendered_height(cell);
+        }
         let lines = if index == self.selected && self.mode == AppMode::Edit {
             self.editor.lines().len().max(1)
         } else {
             cell.source.lines().count().max(1)
         };
         (lines as u16) + 2
+    }
+
+    fn markdown_rendered_height(&self, cell: &Cell) -> u16 {
+        let rendered =
+            render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme);
+        let rows = rendered
+            .blocks
+            .iter()
+            .map(|block| match block {
+                MarkdownBlock::Image { path, missing, .. }
+                    if !*missing && path.is_some() && self.terminal_images.is_some() =>
+                {
+                    inline_markdown_image_height()
+                }
+                _ => 1,
+            })
+            .sum::<u16>()
+            .max(1);
+        rows + 2
     }
 
     fn sync_editor_row_offset(&mut self, visible_height: usize) {
@@ -1813,7 +1946,9 @@ impl App {
             self.editor_row_offset = cursor_row;
             return;
         }
-        let last_visible = self.editor_row_offset.saturating_add(visible_height.saturating_sub(1));
+        let last_visible = self
+            .editor_row_offset
+            .saturating_add(visible_height.saturating_sub(1));
         if cursor_row > last_visible {
             self.editor_row_offset = cursor_row.saturating_sub(visible_height.saturating_sub(1));
         }
@@ -1840,7 +1975,8 @@ impl App {
         self.sync_editor_row_offset(inner.height as usize);
         let selection_style = self.editor.selection_style();
         let lines = self.editor.lines().to_vec();
-        let highlighted = SyntaxHighlighter::highlight_with_theme(cell.language, &lines.join("\n"), &self.theme);
+        let highlighted =
+            SyntaxHighlighter::highlight_with_theme(cell.language, &lines.join("\n"), &self.theme);
         let cursor = self.editor.cursor();
         let selection = self.editor.selection_range();
 
@@ -1873,6 +2009,198 @@ impl App {
                 cursor_x.min(max_x),
                 inner.y.saturating_add(cursor_screen_row as u16),
             ));
+        }
+    }
+
+    fn render_markdown_cell(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        index: usize,
+        cell: &Cell,
+        shell_style: Style,
+        border_style: Style,
+    ) {
+        let block = Block::default()
+            .title("markdown rendered")
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .style(shell_style);
+        frame.render_widget(block, area);
+        let inner = shrink(area, 1);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        self.hit_regions.push(HitRegion {
+            rect: area,
+            target: HitTarget::CellEditor(index),
+        });
+
+        let rendered =
+            render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme);
+        let mut y = inner.y;
+        for (block_index, block) in rendered.blocks.iter().enumerate() {
+            if y >= inner.y.saturating_add(inner.height) {
+                break;
+            }
+            match block {
+                MarkdownBlock::Text { line, links, .. } => {
+                    let line_area = Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    };
+                    let highlighted = if index == self.selected
+                        && self.copy_target == CopyTarget::CellBody
+                    {
+                        let selection = self.mouse_text_selection_for(index, CopyTarget::CellBody);
+                        selection
+                            .and_then(|selection| markdown_selection_line(selection, block_index))
+                            .map(|selection| {
+                                apply_mouse_selection_to_text(
+                                    Text::from(vec![line.clone()]),
+                                    Some(selection),
+                                    self.theme.style("cell.prompt.selected"),
+                                )
+                            })
+                            .unwrap_or_else(|| Text::from(vec![line.clone()]))
+                    } else {
+                        Text::from(vec![line.clone()])
+                    };
+                    frame.render_widget(Paragraph::new(highlighted), line_area);
+                    for (link_index, link) in links.iter().enumerate() {
+                        if let Some(path) = &link.path {
+                            self.hit_regions.push(HitRegion {
+                                rect: Rect {
+                                    x: inner.x.saturating_add(link.start_col as u16),
+                                    y,
+                                    width: link.width.min(inner.width as usize) as u16,
+                                    height: 1,
+                                },
+                                target: HitTarget::MarkdownImageOpen(
+                                    index,
+                                    block_index,
+                                    link_index,
+                                ),
+                            });
+                            let _ = path;
+                        }
+                    }
+                    y = y.saturating_add(1);
+                }
+                MarkdownBlock::Image {
+                    alt, path, missing, ..
+                } => {
+                    let height = inline_markdown_image_height()
+                        .min(inner.y.saturating_add(inner.height).saturating_sub(y));
+                    let image_area = Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height,
+                    };
+                    let mut rendered_inline = false;
+                    if !*missing {
+                        if let Some(path) = path {
+                            rendered_inline =
+                                self.render_inline_markdown_image(frame, image_area, path);
+                            if rendered_inline {
+                                self.hit_regions.push(HitRegion {
+                                    rect: image_area,
+                                    target: HitTarget::MarkdownImageOpen(index, block_index, 0),
+                                });
+                            }
+                        }
+                    }
+
+                    if !rendered_inline {
+                        let link_style = if *missing {
+                            self.theme.style("markdown.image.missing")
+                        } else {
+                            self.theme.style("markdown.image.link")
+                        };
+                        let line_area = Rect {
+                            x: inner.x,
+                            y,
+                            width: inner.width,
+                            height: 1,
+                        };
+                        let text = Text::from(vec![Line::from(vec![Span::styled(
+                            alt.clone(),
+                            link_style,
+                        )])]);
+                        let text =
+                            if index == self.selected && self.copy_target == CopyTarget::CellBody {
+                                let selection =
+                                    self.mouse_text_selection_for(index, CopyTarget::CellBody);
+                                selection
+                                    .and_then(|selection| {
+                                        markdown_selection_line(selection, block_index)
+                                    })
+                                    .map(|selection| {
+                                        apply_mouse_selection_to_text(
+                                            text.clone(),
+                                            Some(selection),
+                                            self.theme.style("cell.prompt.selected"),
+                                        )
+                                    })
+                                    .unwrap_or(text)
+                            } else {
+                                text
+                            };
+                        frame.render_widget(Paragraph::new(text), line_area);
+                        if !*missing {
+                            self.hit_regions.push(HitRegion {
+                                rect: Rect {
+                                    x: inner.x,
+                                    y,
+                                    width: alt.chars().count().min(inner.width as usize) as u16,
+                                    height: 1,
+                                },
+                                target: HitTarget::MarkdownImageOpen(index, block_index, 0),
+                            });
+                        }
+                        y = y.saturating_add(1);
+                    } else {
+                        y = y.saturating_add(height);
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_inline_markdown_image(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        path: &Path,
+    ) -> bool {
+        let Some(support) = self.terminal_images.as_ref() else {
+            return false;
+        };
+        if area.width == 0 || area.height == 0 {
+            return false;
+        }
+
+        if !self.markdown_image_cache.contains_key(path) {
+            let Ok(image) = load_markdown_image(path) else {
+                return false;
+            };
+            let protocol = support.picker().new_resize_protocol(image);
+            self.markdown_image_cache
+                .insert(path.to_path_buf(), protocol);
+        }
+
+        if let Some(protocol) = self.markdown_image_cache.get_mut(path) {
+            frame.render_stateful_widget(
+                StatefulImage::<StatefulProtocol>::default().resize(Resize::Fit(None)),
+                area,
+                protocol,
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -1979,19 +2307,72 @@ impl App {
     }
 
     fn first_image_output<'a>(&self, cell: &'a Cell) -> Option<&'a CellOutput> {
-        cell.outputs.iter().find(|output| output.image_info().is_some())
+        cell.outputs
+            .iter()
+            .find(|output| output.image_info().is_some())
     }
 
-    fn open_selected_image(&mut self) -> Result<()> {
+    fn first_markdown_image(&self, cell: &Cell) -> Option<(usize, PathBuf)> {
+        let rendered =
+            render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme);
+        rendered
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(index, block)| match block {
+                MarkdownBlock::Image {
+                    path: Some(path),
+                    missing: false,
+                    ..
+                } => Some((index, path.clone())),
+                MarkdownBlock::Text { links, .. } => links
+                    .iter()
+                    .find_map(|link| link.path.clone())
+                    .map(|path| (index, path)),
+                _ => None,
+            })
+    }
+
+    fn open_selected_visual(&mut self) -> Result<()> {
         let Some(cell) = self.notebook.cells.get(self.selected) else {
             return Ok(());
         };
-        let Some(output) = self.first_image_output(cell) else {
-            self.status = "selected cell has no image output".to_string();
+        if let Some(output) = self.first_image_output(cell) {
+            let Some(path) = resolve_image_output_path(output, self.notebook_path.as_deref())
+            else {
+                self.status = "image output has no materialized file path yet".to_string();
+                return Ok(());
+            };
+            open_path_with_system(&path)?;
+            self.status = format!("opened image {}", path.display());
+            return Ok(());
+        }
+        if let Some((_, path)) = self.first_markdown_image(cell) {
+            open_path_with_system(&path)?;
+            self.status = format!("opened image {}", path.display());
+            return Ok(());
+        }
+        self.status = "selected cell has no image".to_string();
+        Ok(())
+    }
+
+    fn open_markdown_image(
+        &mut self,
+        cell_index: usize,
+        block_index: usize,
+        link_index: usize,
+    ) -> Result<()> {
+        let Some(cell) = self.notebook.cells.get(cell_index) else {
             return Ok(());
         };
-        let Some(path) = resolve_image_output_path(output, self.notebook_path.as_deref()) else {
-            self.status = "image output has no materialized file path yet".to_string();
+        let rendered =
+            render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme);
+        let Some(path) = rendered
+            .blocks
+            .get(block_index)
+            .and_then(|block| markdown_block_path(block, link_index))
+        else {
+            self.status = "markdown image is missing".to_string();
             return Ok(());
         };
         open_path_with_system(&path)?;
@@ -2086,7 +2467,10 @@ impl App {
 
     fn selected_mouse_text(&self, target: CopyTarget) -> Option<String> {
         let selection = self.mouse_text_selection?;
-        if selection.cell_index != self.selected || selection.target != target || selection.is_empty() {
+        if selection.cell_index != self.selected
+            || selection.target != target
+            || selection.is_empty()
+        {
             return None;
         }
         let cell = self.notebook.cells.get(self.selected)?;
@@ -2124,27 +2508,142 @@ fn input_from_key_event(key: KeyEvent) -> Input {
     }
 }
 
-fn render_markdown_block(source: &str, theme: &Theme) -> Text<'static> {
-    let mut lines = Vec::new();
-    for line in source.lines() {
-        if let Some(rest) = line.strip_prefix("# ") {
-            lines.push(Line::from(vec![Span::styled(
-                rest.to_string(),
-                theme.style("markdown.heading1"),
-            )]));
-        } else if let Some(rest) = line.strip_prefix("## ") {
-            lines.push(Line::from(vec![Span::styled(
-                rest.to_string(),
-                theme.style("markdown.heading2"),
-            )]));
-        } else {
-            lines.push(Line::from(line.to_string()));
+fn render_markdown_blocks(
+    source: &str,
+    notebook_path: Option<&Path>,
+    theme: &Theme,
+) -> RenderedMarkdown {
+    let mut blocks = Vec::new();
+    for raw_line in source.lines() {
+        if let Some((alt, path)) = standalone_markdown_image(raw_line) {
+            let resolved = resolve_markdown_image_path(&path, notebook_path);
+            let exists = validate_markdown_image_path(&resolved).is_ok();
+            let alt = if alt.is_empty() {
+                markdown_image_alt(&path)
+            } else {
+                alt
+            };
+            if exists {
+                blocks.push(MarkdownBlock::Image {
+                    plain: alt.clone(),
+                    alt,
+                    path: Some(resolved),
+                    missing: false,
+                });
+            } else {
+                blocks.push(MarkdownBlock::Image {
+                    plain: alt.clone(),
+                    alt,
+                    path: None,
+                    missing: true,
+                });
+            }
+            continue;
         }
+
+        let (content, base_style) = if let Some(rest) = raw_line.strip_prefix("# ") {
+            (rest, theme.style("markdown.heading1"))
+        } else if let Some(rest) = raw_line.strip_prefix("## ") {
+            (rest, theme.style("markdown.heading2"))
+        } else {
+            (raw_line, theme.style("text.default"))
+        };
+        blocks.push(parse_markdown_text_line(
+            content,
+            notebook_path,
+            theme,
+            base_style,
+        ));
     }
-    if lines.is_empty() {
-        lines.push(Line::from(String::new()));
+    if blocks.is_empty() {
+        blocks.push(MarkdownBlock::Text {
+            line: Line::from(String::new()),
+            plain: String::new(),
+            links: Vec::new(),
+        });
     }
-    Text::from(lines)
+    RenderedMarkdown { blocks }
+}
+
+fn standalone_markdown_image(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let (start, end, alt, path) = markdown_image_at(trimmed, 0)?;
+    if start == 0 && end == trimmed.len() {
+        Some((alt, path))
+    } else {
+        None
+    }
+}
+
+fn parse_markdown_text_line(
+    line: &str,
+    notebook_path: Option<&Path>,
+    theme: &Theme,
+    base_style: Style,
+) -> MarkdownBlock {
+    let mut spans = Vec::new();
+    let mut links = Vec::new();
+    let mut plain = String::new();
+    let mut cursor = 0usize;
+    while let Some((start, end, alt, path)) = markdown_image_at(line, cursor) {
+        if start > cursor {
+            let text = &line[cursor..start];
+            plain.push_str(text);
+            spans.push(Span::styled(text.to_string(), base_style));
+        }
+        let resolved = resolve_markdown_image_path(&path, notebook_path);
+        let exists = validate_markdown_image_path(&resolved).is_ok();
+        let alt = if alt.is_empty() {
+            markdown_image_alt(&path)
+        } else {
+            alt
+        };
+        let start_col = plain.chars().count();
+        plain.push_str(&alt);
+        spans.push(Span::styled(
+            alt.clone(),
+            if exists {
+                theme.style("markdown.image.link")
+            } else {
+                theme.style("markdown.image.missing")
+            },
+        ));
+        links.push(MarkdownLinkSpan {
+            start_col,
+            width: alt.chars().count(),
+            path: exists.then_some(resolved),
+        });
+        cursor = end;
+    }
+    if cursor < line.len() {
+        let text = &line[cursor..];
+        plain.push_str(text);
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+    MarkdownBlock::Text {
+        line: Line::from(spans),
+        plain,
+        links,
+    }
+}
+
+fn markdown_image_at(line: &str, from: usize) -> Option<(usize, usize, String, String)> {
+    let haystack = &line[from..];
+    let image_start_rel = haystack.find("![")?;
+    let start = from + image_start_rel;
+    let alt_start = start + 2;
+    let alt_end = line[alt_start..].find("](")? + alt_start;
+    let path_start = alt_end + 2;
+    let path_end = line[path_start..].find(')')? + path_start;
+    Some((
+        start,
+        path_end + 1,
+        line[alt_start..alt_end].to_string(),
+        line[path_start..path_end].to_string(),
+    ))
 }
 
 fn text_lines_for_target(
@@ -2154,7 +2653,10 @@ fn text_lines_for_target(
 ) -> Vec<String> {
     match target {
         CopyTarget::CellBody => match cell.kind {
-            CellKind::Markdown => text_to_plain_lines(render_markdown_block(&cell.source, &Theme::default_theme())),
+            CellKind::Markdown => {
+                render_markdown_blocks(&cell.source, notebook_path, &Theme::default_theme())
+                    .plain_lines()
+            }
             _ => cell.source.lines().map(|line| line.to_string()).collect(),
         },
         CopyTarget::CellOutput => output_text(cell, notebook_path)
@@ -2164,16 +2666,52 @@ fn text_lines_for_target(
     }
 }
 
-fn text_to_plain_lines(text: Text<'static>) -> Vec<String> {
-    text.lines
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .into_iter()
-                .map(|span| span.content.into_owned())
-                .collect::<String>()
-        })
-        .collect()
+fn markdown_selection_line(
+    selection: MouseTextSelection,
+    line_index: usize,
+) -> Option<MouseTextSelection> {
+    let (start, end) = selection.normalized();
+    if line_index < start.row || line_index > end.row {
+        return None;
+    }
+    let anchor = if line_index == start.row {
+        TextPoint {
+            row: 0,
+            col: start.col,
+        }
+    } else {
+        TextPoint { row: 0, col: 0 }
+    };
+    let focus = if line_index == end.row {
+        TextPoint {
+            row: 0,
+            col: end.col,
+        }
+    } else {
+        TextPoint {
+            row: 0,
+            col: usize::MAX / 2,
+        }
+    };
+    Some(MouseTextSelection {
+        cell_index: selection.cell_index,
+        target: selection.target,
+        anchor,
+        focus,
+    })
+}
+
+fn markdown_block_path(block: &MarkdownBlock, link_index: usize) -> Option<PathBuf> {
+    match block {
+        MarkdownBlock::Image { path, .. } => path.clone(),
+        MarkdownBlock::Text { links, .. } => {
+            links.get(link_index).and_then(|link| link.path.clone())
+        }
+    }
+}
+
+fn inline_markdown_image_height() -> u16 {
+    12
 }
 
 fn apply_mouse_selection_to_text(
@@ -2207,7 +2745,11 @@ fn apply_selection_to_line(
 ) -> Line<'static> {
     let mut chars = flatten_line_spans(line);
     if start.row <= line_index && line_index <= end.row {
-        let selection_start = if line_index == start.row { start.col } else { 0 };
+        let selection_start = if line_index == start.row {
+            start.col
+        } else {
+            0
+        };
         let selection_end = if line_index == end.row {
             end.col
         } else {
@@ -2254,7 +2796,11 @@ fn render_editor_line(
     }
 
     if let Some(((start_row, start_col), (end_row, end_col))) = selection {
-        let selection_start = if line_index == start_row { start_col } else { 0 };
+        let selection_start = if line_index == start_row {
+            start_col
+        } else {
+            0
+        };
         let selection_end = if line_index == end_row {
             end_col
         } else if start_row <= line_index && line_index < end_row {
@@ -2504,8 +3050,15 @@ fn selected_editor_text(editor: &TextArea<'_>) -> Option<String> {
 fn should_copy_vim_selection(mode: VimMode, input: Input, transition: &VimTransition) -> bool {
     matches!(
         (mode, input.key, transition),
-        (VimMode::Visual, Key::Char('y'), VimTransition::Mode(VimMode::Normal))
-            | (VimMode::Operator('y'), _, VimTransition::Mode(VimMode::Normal))
+        (
+            VimMode::Visual,
+            Key::Char('y'),
+            VimTransition::Mode(VimMode::Normal)
+        ) | (
+            VimMode::Operator('y'),
+            _,
+            VimTransition::Mode(VimMode::Normal)
+        )
     )
 }
 
@@ -2514,7 +3067,10 @@ fn text_point_from_mouse(region: &ContentRegion, column: u16, row: u16, app: &Ap
     let lines = text_lines_for_target(cell, region.target, app.notebook_path.as_deref());
     let local_row = row.saturating_sub(region.rect.y) as usize;
     let line_index = local_row.min(lines.len().saturating_sub(1));
-    let line_len = lines.get(line_index).map(|line| line.chars().count()).unwrap_or(0);
+    let line_len = lines
+        .get(line_index)
+        .map(|line| line.chars().count())
+        .unwrap_or(0);
     let local_col = column.saturating_sub(region.rect.x) as usize;
     TextPoint {
         row: line_index,
@@ -2522,7 +3078,10 @@ fn text_point_from_mouse(region: &ContentRegion, column: u16, row: u16, app: &Ap
     }
 }
 
-fn resolve_image_output_path(output: &CellOutput, notebook_path: Option<&std::path::Path>) -> Option<PathBuf> {
+fn resolve_image_output_path(
+    output: &CellOutput,
+    notebook_path: Option<&std::path::Path>,
+) -> Option<PathBuf> {
     let image = output.image_info()?;
     let path = image.path?;
     let path_buf = PathBuf::from(&path);
@@ -2587,11 +3146,11 @@ fn shrink(rect: Rect, amount: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use crate::clipboard::Clipboard;
     use crate::runtime::SessionManager;
     use crate::theme::Theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use tempfile::TempDir;
 
     #[test]
@@ -2639,6 +3198,76 @@ mod tests {
     }
 
     #[test]
+    fn standalone_markdown_image_becomes_image_block_when_file_exists() {
+        let temp = TempDir::new().unwrap();
+        let notebook_path = temp.path().join("demo.smd");
+        let image_path = temp.path().join("chart.png");
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        image.save(&image_path).unwrap();
+
+        let rendered = render_markdown_blocks(
+            "![chart](./chart.png)",
+            Some(&notebook_path),
+            &Theme::default_theme(),
+        );
+
+        assert!(matches!(
+            rendered.blocks.first(),
+            Some(MarkdownBlock::Image {
+                path: Some(path),
+                missing: false,
+                ..
+            }) if path == &image_path
+        ));
+    }
+
+    #[test]
+    fn missing_markdown_image_falls_back_to_plain_alt_text() {
+        let temp = TempDir::new().unwrap();
+        let notebook_path = temp.path().join("demo.smd");
+
+        let rendered = render_markdown_blocks(
+            "![missing chart](./missing.png)",
+            Some(&notebook_path),
+            &Theme::default_theme(),
+        );
+
+        assert!(matches!(
+            rendered.blocks.first(),
+            Some(MarkdownBlock::Image {
+                alt,
+                path: None,
+                missing: true,
+                ..
+            }) if alt == "missing chart"
+        ));
+    }
+
+    #[test]
+    fn inline_markdown_image_becomes_clickable_alt_span() {
+        let temp = TempDir::new().unwrap();
+        let notebook_path = temp.path().join("demo.smd");
+        let image_path = temp.path().join("chart.png");
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+        image.save(&image_path).unwrap();
+
+        let rendered = render_markdown_blocks(
+            "prefix ![chart](./chart.png) suffix",
+            Some(&notebook_path),
+            &Theme::default_theme(),
+        );
+
+        match rendered.blocks.first().unwrap() {
+            MarkdownBlock::Text { plain, links, .. } => {
+                assert_eq!(plain, "prefix chart suffix");
+                assert_eq!(links.len(), 1);
+                assert_eq!(links[0].path.as_ref(), Some(&image_path));
+            }
+            other => panic!("unexpected markdown block: {other:?}"),
+        }
+    }
+
+    #[test]
     fn vim_mode_can_be_toggled_in_session() {
         let notebook = Notebook::new("Vim").with_cells(vec![Cell::markdown("hello")]);
         let session = SessionManager::new(&notebook);
@@ -2653,8 +3282,8 @@ mod tests {
 
     #[test]
     fn run_selected_cell_updates_inline_outputs() {
-        let notebook = Notebook::new("Run")
-            .with_cells(vec![Cell::code(Language::Python, "print('hello')")]);
+        let notebook =
+            Notebook::new("Run").with_cells(vec![Cell::code(Language::Python, "print('hello')")]);
         let mut session = SessionManager::new(&notebook);
         session.register_default_kernels().unwrap();
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
@@ -2713,11 +3342,8 @@ mod tests {
     #[test]
     fn editor_line_renderer_preserves_highlighted_content() {
         let theme = Theme::default_theme();
-        let highlighted = SyntaxHighlighter::highlight_with_theme(
-            Language::Python,
-            "def make_blobs(x):",
-            &theme,
-        );
+        let highlighted =
+            SyntaxHighlighter::highlight_with_theme(Language::Python, "def make_blobs(x):", &theme);
 
         let line = render_editor_line(
             "def make_blobs(x):",
@@ -2864,8 +3490,8 @@ mod tests {
 
     #[test]
     fn body_collapse_hides_input_height_and_expands_on_edit() {
-        let notebook =
-            Notebook::new("Fold").with_cells(vec![Cell::code(Language::Python, "print(1)\nprint(2)")]);
+        let notebook = Notebook::new("Fold")
+            .with_cells(vec![Cell::code(Language::Python, "print(1)\nprint(2)")]);
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
@@ -2942,7 +3568,8 @@ mod tests {
             .map(|index| format!("line_{index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let notebook = Notebook::new("LongDraw").with_cells(vec![Cell::code(Language::Python, source)]);
+        let notebook =
+            Notebook::new("LongDraw").with_cells(vec![Cell::code(Language::Python, source)]);
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
         let backend = TestBackend::new(120, 40);
@@ -3003,7 +3630,8 @@ mod tests {
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
-        app.activate_hit_target(HitTarget::CellSelect(0), 0, 0).unwrap();
+        app.activate_hit_target(HitTarget::CellSelect(0), 0, 0)
+            .unwrap();
 
         assert_eq!(app.mode, AppMode::Command);
     }
@@ -3014,7 +3642,8 @@ mod tests {
         let session = SessionManager::new(&notebook);
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
-        app.activate_hit_target(HitTarget::CellToggleBody(0), 0, 0).unwrap();
+        app.activate_hit_target(HitTarget::CellToggleBody(0), 0, 0)
+            .unwrap();
 
         assert!(app.cell_mode(&app.notebook.cells[0]).body_collapsed);
     }
