@@ -813,11 +813,11 @@ impl App {
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll_rows(1);
+                self.scroll_rows(self.wheel_scroll_amount());
                 return Ok(());
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_rows(-1);
+                self.scroll_rows(-self.wheel_scroll_amount());
                 return Ok(());
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2358,6 +2358,10 @@ impl App {
 
     fn page_scroll_amount(&self) -> isize {
         self.notebook_area.height.saturating_sub(1).max(1) as isize
+    }
+
+    fn wheel_scroll_amount(&self) -> isize {
+        3
     }
 
     fn clamp_scroll_offset(&mut self) {
