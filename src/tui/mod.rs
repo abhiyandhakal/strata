@@ -1443,6 +1443,7 @@ impl App {
             self.notebook.metadata.runtime.environment = "system".to_string();
         }
         self.reconfigure_runtime()?;
+        self.persist_runtime_selection()?;
         self.status = format!(
             "kernel set to {}",
             self.notebook.metadata.runtime.kernel.display_name()
@@ -1459,7 +1460,18 @@ impl App {
         let next = (current + 1) % options.len();
         self.notebook.metadata.runtime.environment = options[next].id.clone();
         self.reconfigure_runtime()?;
+        self.persist_runtime_selection()?;
         self.status = format!("environment set to {}", options[next].label);
+        Ok(())
+    }
+
+    fn persist_runtime_selection(&mut self) -> Result<()> {
+        if let Some(path) = self.notebook_path.clone() {
+            self.sync_manifest_ui_state();
+            NotebookStorage::save(&path, &self.notebook)
+                .with_context(|| format!("failed to save {}", path.display()))?;
+            self.save_checkpoint_only()?;
+        }
         Ok(())
     }
 
@@ -2883,6 +2895,32 @@ mod tests {
 
         assert!(collapsed < expanded);
         assert!(!app.cell_mode(&app.notebook.cells[0]).body_collapsed);
+    }
+
+    #[test]
+    fn cycling_environment_persists_to_notebook_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("demo.smd");
+        let mut notebook = Notebook::new("Env");
+        notebook.metadata.runtime.environment = "none".to_string();
+        NotebookStorage::save(&path, &notebook).unwrap();
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(
+            notebook,
+            Some(path.clone()),
+            session,
+            false,
+            Theme::default_theme(),
+            None,
+        );
+
+        app.cycle_environment().unwrap();
+
+        let saved = NotebookStorage::load(&path).unwrap();
+        assert_eq!(
+            saved.metadata.runtime.environment,
+            app.notebook.metadata.runtime.environment
+        );
     }
 
     #[test]
