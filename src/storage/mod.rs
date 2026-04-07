@@ -872,7 +872,7 @@ enum IpynbCell {
         execution_count: Option<u32>,
         #[serde(default)]
         source: SourceField,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         outputs: Vec<CellOutput>,
     },
 }
