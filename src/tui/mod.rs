@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +26,8 @@ use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 use crate::clipboard::{Clipboard, ClipboardResult};
 use crate::core::{
-    Cell, CellKind, CellOutput, CellUiState, ExecutionStatus, KernelKind, Language, Notebook,
+    Cell, CellId, CellKind, CellOutput, CellUiState, ExecutionRecord, ExecutionStatus, KernelKind,
+    Language, Notebook,
 };
 use crate::media::{
     TerminalImageSupport, load_markdown_image, markdown_image_alt, resolve_markdown_image_path,
@@ -49,6 +52,46 @@ struct ExCommandState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingModal {
     QuitConfirm,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecutionState {
+    Idle,
+    RunningCell {
+        index: usize,
+        cell_id: CellId,
+        started_at: Instant,
+    },
+    RunningAll {
+        current_index: usize,
+        remaining: usize,
+        started_at: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunJob {
+    Cell { index: usize },
+    All,
+}
+
+enum WorkerMessage {
+    Progress(ExecutionState),
+    Completed(WorkerCompletion),
+}
+
+struct WorkerCompletion {
+    notebook: Notebook,
+    session: SessionManager,
+    outcome: RunOutcome,
+}
+
+enum RunOutcome {
+    Cell(Result<ExecutionRecord, String>),
+    All {
+        completed: usize,
+        failure: Option<(usize, String)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,7 +592,7 @@ pub struct App {
     pub status: String,
     notebook_path: Option<PathBuf>,
     checkpoint_paths: Option<CheckpointPaths>,
-    pub session: SessionManager,
+    pub session: Option<SessionManager>,
     mode: AppMode,
     editor: TextArea<'static>,
     vim_enabled: bool,
@@ -577,6 +620,8 @@ pub struct App {
     pending_modal: Option<PendingModal>,
     last_saved_snapshot: String,
     active_hit_target: Option<(HitTarget, Instant)>,
+    execution_state: ExecutionState,
+    worker_rx: Option<Receiver<WorkerMessage>>,
 }
 
 impl App {
@@ -635,7 +680,7 @@ impl App {
             status: String::new(),
             notebook_path,
             checkpoint_paths,
-            session,
+            session: Some(session),
             mode: AppMode::Command,
             editor: TextArea::default(),
             vim_enabled,
@@ -663,6 +708,8 @@ impl App {
             pending_modal: None,
             last_saved_snapshot: String::new(),
             active_hit_target: None,
+            execution_state: ExecutionState::Idle,
+            worker_rx: None,
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
@@ -759,6 +806,13 @@ impl App {
     }
 
     fn handle_edit_mode(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            self.mode = AppMode::Command;
+            self.vim = None;
+            self.refresh_status();
+            return Ok(false);
+        }
         if self.ex_command.is_some() {
             return self.handle_ex_command(key);
         }
@@ -963,6 +1017,7 @@ impl App {
         terminal: &mut Terminal<B>,
     ) -> Result<()> {
         loop {
+            self.poll_worker_messages()?;
             terminal.draw(|frame| self.draw(frame))?;
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
@@ -1015,12 +1070,14 @@ impl App {
         let display_title = self.notebook.display_title(self.notebook_path.as_deref());
         let kernel_label = self.notebook.metadata.runtime.kernel.display_name();
         let environment_label = self.current_environment_label();
+        let busy_label = if self.is_busy() { " (busy)" } else { "" };
         let title = Line::from(vec![
             Span::raw(format!(
-                "{}{} | kernel={} | env={} | mode={:?} | ",
+                "{}{} | kernel={}{} | env={} | mode={:?} | ",
                 display_title,
                 if self.is_dirty() { " *" } else { "" },
                 kernel_label,
+                busy_label,
                 environment_label,
                 self.mode
             )),
@@ -1213,11 +1270,7 @@ impl App {
             self.theme.style("cell.border")
         };
         let prompt = match cell.kind {
-            CellKind::Code => format!(
-                "In [{}]:",
-                cell.execution_count
-                    .map_or(" ".to_string(), |n| n.to_string())
-            ),
+            CellKind::Code => self.cell_prompt(index, cell),
             CellKind::Markdown => "[Markdown]".to_string(),
             CellKind::Raw => "[Raw]".to_string(),
             CellKind::Ai => "[AI]".to_string(),
@@ -1319,11 +1372,7 @@ impl App {
             self.theme.style("cell.prompt")
         };
         let prompt = match cell.kind {
-            CellKind::Code => format!(
-                "In [{}]:",
-                cell.execution_count
-                    .map_or(" ".to_string(), |n| n.to_string())
-            ),
+            CellKind::Code => self.cell_prompt(index, cell),
             CellKind::Markdown => "[Markdown]".to_string(),
             CellKind::Raw => "[Raw]".to_string(),
             CellKind::Ai => "[AI]".to_string(),
@@ -1619,6 +1668,10 @@ impl App {
     }
 
     fn insert_code_cell(&mut self) {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return;
+        }
         let next = usize::min(
             self.selected
                 .map(|selected| selected.saturating_add(1))
@@ -1639,6 +1692,10 @@ impl App {
     }
 
     fn insert_markdown_cell(&mut self) {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return;
+        }
         let next = usize::min(
             self.selected
                 .map(|selected| selected.saturating_add(1))
@@ -1663,6 +1720,10 @@ impl App {
     }
 
     fn delete_selected_cell(&mut self) {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return;
+        }
         let Some(selected) = self.selected else {
             self.status = "no cell selected".to_string();
             return;
@@ -1693,6 +1754,10 @@ impl App {
     }
 
     fn save_all(&mut self) -> Result<()> {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return Ok(());
+        }
         self.apply_editor_to_cell();
         self.sync_manifest_ui_state();
         if let Some(path) = &self.notebook_path {
@@ -1706,17 +1771,24 @@ impl App {
     }
 
     fn save_checkpoint_only(&mut self) -> Result<()> {
+        if self.is_busy() {
+            return Ok(());
+        }
         self.sync_manifest_ui_state();
         if let Some(paths) = &self.checkpoint_paths {
-            CheckpointStorage::save(paths, &self.session.manifest)?;
+            if let Some(session) = self.session.as_ref() {
+                CheckpointStorage::save(paths, &session.manifest)?;
+            }
         }
         Ok(())
     }
 
     fn sync_manifest_ui_state(&mut self) {
-        self.session.manifest.ui_state.selected_cell = self.selected;
-        self.session.manifest.ui_state.viewport_row = self.scroll_offset as usize;
-        self.session.manifest.ui_state.cell_modes = self.cell_modes.clone();
+        if let Some(session) = self.session.as_mut() {
+            session.manifest.ui_state.selected_cell = self.selected;
+            session.manifest.ui_state.viewport_row = self.scroll_offset as usize;
+            session.manifest.ui_state.cell_modes = self.cell_modes.clone();
+        }
     }
 
     fn notebook_snapshot(&self) -> String {
@@ -1728,6 +1800,10 @@ impl App {
     }
 
     fn run_selected_cell(&mut self) -> Result<()> {
+        if self.is_busy() {
+            self.status = "execution already in progress".to_string();
+            return Ok(());
+        }
         let Some(selected) = self.selected else {
             self.status = "no cell selected".to_string();
             return Ok(());
@@ -1743,40 +1819,35 @@ impl App {
                 return Ok(());
             }
         }
-        let record = self.session.run_cell_at(&mut self.notebook, selected)?;
-        self.save_checkpoint_only()?;
-        self.status = format!(
-            "ran {} -> {:?} (exit {})",
-            record.cell_id, record.status, record.exit_code
-        );
-        if record.status == ExecutionStatus::Failed {
-            self.mode = AppMode::Command;
-            self.vim = None;
-            self.sync_editor_presentation();
-        }
+        self.start_run_job(RunJob::Cell { index: selected })?;
         Ok(())
     }
 
     fn run_all_cells(&mut self) -> Result<()> {
-        self.apply_editor_to_cell();
-        for index in 0..self.notebook.cells.len() {
-            if self.is_cell_runnable(&self.notebook.cells[index]) {
-                self.selected = Some(index);
-                self.session.run_cell_at(&mut self.notebook, index)?;
-            }
+        if self.is_busy() {
+            self.status = "execution already in progress".to_string();
+            return Ok(());
         }
-        self.save_checkpoint_only()?;
-        self.status = "ran all executable cells".to_string();
+        self.apply_editor_to_cell();
+        self.start_run_job(RunJob::All)?;
         Ok(())
     }
 
     fn restart_runtime(&mut self) -> Result<()> {
-        self.session.restart_all()?;
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return Ok(());
+        }
+        self.session_mut()?.restart_all()?;
         self.status = "restarted notebook runtime".to_string();
         Ok(())
     }
 
     fn cycle_kernel(&mut self) -> Result<()> {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return Ok(());
+        }
         self.notebook.metadata.runtime.kernel = match self.notebook.metadata.runtime.kernel {
             KernelKind::Python => KernelKind::Bash,
             KernelKind::Bash => KernelKind::JavaScript,
@@ -1800,6 +1871,10 @@ impl App {
     }
 
     fn cycle_environment(&mut self) -> Result<()> {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return Ok(());
+        }
         let options = self.current_environment_options();
         let current = options
             .iter()
@@ -1825,6 +1900,10 @@ impl App {
     }
 
     fn enter_edit_mode(&mut self) {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return;
+        }
         let Some(selected) = self.selected else {
             self.status = "no cell selected".to_string();
             return;
@@ -2098,6 +2177,10 @@ impl App {
     }
 
     fn request_quit(&mut self) -> Result<bool> {
+        if self.is_busy() {
+            self.status = "execution in progress".to_string();
+            return Ok(false);
+        }
         if self.is_dirty() {
             self.pending_modal = Some(PendingModal::QuitConfirm);
             self.status = "unsaved changes".to_string();
@@ -2652,8 +2735,10 @@ impl App {
     }
 
     fn reconfigure_runtime(&mut self) -> Result<()> {
-        self.session
-            .configure_for_notebook(&self.notebook, self.notebook_path.as_deref())?;
+        let notebook = self.notebook.clone();
+        let notebook_path = self.notebook_path.clone();
+        self.session_mut()?
+            .configure_for_notebook(&notebook, notebook_path.as_deref())?;
         self.python_lsp_client = None;
         self.python_lsp = PythonLspStatus::detect();
         self.activate_python_lsp();
@@ -2669,6 +2754,180 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    fn session_mut(&mut self) -> Result<&mut SessionManager> {
+        self.session
+            .as_mut()
+            .context("session unavailable while execution is in progress")
+    }
+
+    fn is_busy(&self) -> bool {
+        !matches!(self.execution_state, ExecutionState::Idle)
+    }
+
+    fn current_running_index(&self) -> Option<usize> {
+        match self.execution_state {
+            ExecutionState::RunningCell { index, .. } => Some(index),
+            ExecutionState::RunningAll { current_index, .. } => Some(current_index),
+            ExecutionState::Idle => None,
+        }
+    }
+
+    fn cell_prompt(&self, index: usize, cell: &Cell) -> String {
+        if self.current_running_index() == Some(index) {
+            "In [*]:".to_string()
+        } else {
+            format!(
+                "In [{}]:",
+                cell.execution_count
+                    .map_or(" ".to_string(), |n| n.to_string())
+            )
+        }
+    }
+
+    fn start_run_job(&mut self, job: RunJob) -> Result<()> {
+        if self.is_busy() {
+            self.status = "execution already in progress".to_string();
+            return Ok(());
+        }
+        let mut notebook = self.notebook.clone();
+        let mut session = self
+            .session
+            .take()
+            .context("session unavailable for execution")?;
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+        self.execution_state = match job {
+            RunJob::Cell { index } => ExecutionState::RunningCell {
+                index,
+                cell_id: notebook.cells[index].id.clone(),
+                started_at: Instant::now(),
+            },
+            RunJob::All => ExecutionState::RunningAll {
+                current_index: 0,
+                remaining: notebook.cells.len(),
+                started_at: Instant::now(),
+            },
+        };
+        self.status = match job {
+            RunJob::Cell { index } => format!("running {}...", notebook.cells[index].id),
+            RunJob::All => "running all cells...".to_string(),
+        };
+        thread::spawn(move || {
+            let outcome = match job {
+                RunJob::Cell { index } => {
+                    let result = session
+                        .run_cell_at(&mut notebook, index)
+                        .map_err(|error| error.to_string());
+                    RunOutcome::Cell(result)
+                }
+                RunJob::All => {
+                    let runnable_indices = notebook
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, cell)| {
+                            ((cell.kind == CellKind::Ai)
+                                || (cell.kind == CellKind::Code
+                                    && notebook.metadata.runtime.environment != "none"
+                                    && cell.language
+                                        == notebook.metadata.runtime.kernel.language()))
+                            .then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    let total = runnable_indices.len();
+                    let mut completed = 0usize;
+                    let mut failure = None;
+                    for (position, index) in runnable_indices.into_iter().enumerate() {
+                        let remaining = total.saturating_sub(position + 1);
+                        let _ = tx.send(WorkerMessage::Progress(ExecutionState::RunningAll {
+                            current_index: index,
+                            remaining,
+                            started_at: Instant::now(),
+                        }));
+                        match session.run_cell_at(&mut notebook, index) {
+                            Ok(record) => {
+                                completed += 1;
+                                if record.status == ExecutionStatus::Failed {
+                                    failure = Some((index, record.cell_id.to_string()));
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                failure = Some((index, error.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                    RunOutcome::All { completed, failure }
+                }
+            };
+            let _ = tx.send(WorkerMessage::Completed(WorkerCompletion {
+                notebook,
+                session,
+                outcome,
+            }));
+        });
+        Ok(())
+    }
+
+    fn poll_worker_messages(&mut self) -> Result<()> {
+        let Some(rx) = self.worker_rx.take() else {
+            return Ok(());
+        };
+        let mut keep_rx = true;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                WorkerMessage::Progress(state) => {
+                    self.execution_state = state;
+                    if let Some(index) = self.current_running_index() {
+                        self.selected = Some(index);
+                    }
+                }
+                WorkerMessage::Completed(completion) => {
+                    self.notebook = completion.notebook;
+                    self.session = Some(completion.session);
+                    self.execution_state = ExecutionState::Idle;
+                    keep_rx = false;
+                    self.save_checkpoint_only()?;
+                    match completion.outcome {
+                        RunOutcome::Cell(result) => match result {
+                            Ok(record) => {
+                                self.status = format!(
+                                    "ran {} -> {:?} (exit {})",
+                                    record.cell_id, record.status, record.exit_code
+                                );
+                                if record.status == ExecutionStatus::Failed {
+                                    self.mode = AppMode::Command;
+                                    self.vim = None;
+                                    self.sync_editor_presentation();
+                                }
+                            }
+                            Err(error) => {
+                                self.status = format!("cell execution failed: {error}");
+                                self.mode = AppMode::Command;
+                                self.vim = None;
+                                self.sync_editor_presentation();
+                            }
+                        },
+                        RunOutcome::All { completed, failure } => {
+                            self.status = match failure {
+                                Some((index, error)) => {
+                                    self.selected = Some(index);
+                                    format!("run all stopped at cell {}: {}", index + 1, error)
+                                }
+                                None => format!("ran all executable cells ({completed})"),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        if keep_rx {
+            self.worker_rx = Some(rx);
+        }
+        Ok(())
     }
 
     fn first_image_output<'a>(&self, cell: &'a Cell) -> Option<&'a CellOutput> {
@@ -3672,9 +3931,45 @@ mod tests {
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
 
         app.run_selected_cell().unwrap();
+        for _ in 0..200 {
+            app.poll_worker_messages().unwrap();
+            if app.notebook.cells[0].execution_count == Some(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         assert_eq!(app.notebook.cells[0].execution_count, Some(1));
         assert!(!app.notebook.cells[0].outputs.is_empty());
+    }
+
+    #[test]
+    fn running_cell_prompt_shows_star_while_busy() {
+        let notebook = Notebook::new("Prompt")
+            .with_cells(vec![Cell::code(Language::Bash, "sleep 0.1\nprintf done")]);
+        let mut session = SessionManager::new(&notebook);
+        session.register_default_kernels().unwrap();
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        app.notebook.metadata.runtime.kernel = KernelKind::Bash;
+
+        app.run_selected_cell().unwrap();
+
+        assert_eq!(app.cell_prompt(0, &app.notebook.cells[0]), "In [*]:");
+    }
+
+    #[test]
+    fn busy_state_blocks_second_run_request() {
+        let notebook = Notebook::new("Busy")
+            .with_cells(vec![Cell::code(Language::Bash, "sleep 0.1\nprintf done")]);
+        let mut session = SessionManager::new(&notebook);
+        session.register_default_kernels().unwrap();
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        app.notebook.metadata.runtime.kernel = KernelKind::Bash;
+
+        app.run_selected_cell().unwrap();
+        app.run_selected_cell().unwrap();
+
+        assert!(app.status.contains("execution already in progress"));
     }
 
     #[test]
