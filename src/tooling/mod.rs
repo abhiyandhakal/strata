@@ -19,7 +19,11 @@ pub enum PythonLspStatus {
 
 impl PythonLspStatus {
     pub fn detect() -> Self {
-        for candidate in ["basedpyright-langserver", "basedpyright", "pyright-langserver"] {
+        for candidate in [
+            "basedpyright-langserver",
+            "basedpyright",
+            "pyright-langserver",
+        ] {
             if command_exists(candidate) {
                 return Self::Available {
                     command: candidate.to_string(),
@@ -75,7 +79,10 @@ impl PythonLspClient {
             .spawn()
             .with_context(|| format!("failed to start python lsp command {command}"))?;
         let stdin = child.stdin.take().context("python lsp stdin unavailable")?;
-        let stdout = child.stdout.take().context("python lsp stdout unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("python lsp stdout unavailable")?;
         let mut client = Self {
             command: command.clone(),
             child,
@@ -397,7 +404,8 @@ mod tests {
 
     #[test]
     fn tree_sitter_highlighter_styles_python_keywords() {
-        let highlighted = SyntaxHighlighter::highlight(Language::Python, "def add(x):\n    return x");
+        let highlighted =
+            SyntaxHighlighter::highlight(Language::Python, "def add(x):\n    return x");
         let rendered = format!("{highlighted:?}");
 
         assert!(rendered.contains("def"));
@@ -407,11 +415,8 @@ mod tests {
     #[test]
     fn tree_sitter_highlighter_accepts_custom_theme() {
         let theme = Theme::default_theme();
-        let highlighted = SyntaxHighlighter::highlight_with_theme(
-            Language::Python,
-            "value = 'hi'",
-            &theme,
-        );
+        let highlighted =
+            SyntaxHighlighter::highlight_with_theme(Language::Python, "value = 'hi'", &theme);
 
         let rendered = format!("{highlighted:?}");
         assert!(rendered.contains("hi"));

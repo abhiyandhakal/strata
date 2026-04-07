@@ -4,9 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use strata::config::StrataConfig;
-use strata::runtime::{
-    load_session_for_notebook, run_notebook_cells, summarize_records,
-};
+use strata::runtime::{load_session_for_notebook, run_notebook_cells, summarize_records};
 use strata::storage::{CheckpointPaths, CheckpointStorage, NotebookFormat, NotebookStorage};
 use strata::theme::ThemeResolver;
 use strata::tui::{App, should_launch_tui};
@@ -22,7 +20,10 @@ use strata::tui::{App, should_launch_tui};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-    #[arg(help = "Path to a Strata `.smd` notebook to open or run", value_name = "NOTEBOOK")]
+    #[arg(
+        help = "Path to a Strata `.smd` notebook to open or run",
+        value_name = "NOTEBOOK"
+    )]
     path: Option<PathBuf>,
 }
 
@@ -50,7 +51,9 @@ fn main() -> Result<()> {
         (Some(Commands::Import { input, output }), None) => import_command(input, output),
         (Some(Commands::Export { input, output }), None) => export_command(input, output),
         (None, Some(path)) => open_or_run_command(path),
-        _ => anyhow::bail!("usage: strata <path.smd> | strata import <file.ipynb> [output.smd] | strata export <file.smd> [output.ipynb]"),
+        _ => anyhow::bail!(
+            "usage: strata <path.smd> | strata import <file.ipynb> [output.smd] | strata export <file.smd> [output.ipynb]"
+        ),
     }
 }
 
@@ -119,8 +122,7 @@ fn export_command(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
         anyhow::bail!("export expects an `.smd` input file");
     }
     let notebook = NotebookStorage::load_smd(&input)?;
-    let output =
-        output.unwrap_or_else(|| input.with_extension(NotebookFormat::Ipynb.extension()));
+    let output = output.unwrap_or_else(|| input.with_extension(NotebookFormat::Ipynb.extension()));
     NotebookStorage::save_ipynb(&output, &notebook)?;
     println!("Exported {} -> {}", input.display(), output.display());
     Ok(())

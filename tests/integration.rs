@@ -437,10 +437,8 @@ fn cli_exports_smd_to_ipynb() {
     let temp = TempDir::new().unwrap();
     let input = temp.path().join("demo.smd");
     let output = temp.path().join("demo.ipynb");
-    let notebook = Notebook::new("Convert").with_cells(vec![Cell::code(
-        Language::Python,
-        "print('ok')",
-    )]);
+    let notebook =
+        Notebook::new("Convert").with_cells(vec![Cell::code(Language::Python, "print('ok')")]);
     NotebookStorage::save_smd(&input, &notebook).unwrap();
 
     Command::cargo_bin("strata")

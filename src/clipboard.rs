@@ -62,7 +62,10 @@ impl Clipboard {
     pub fn write_text(&self, text: &str) -> Result<ClipboardResult> {
         match &self.mode {
             ClipboardMode::Memory(store) => {
-                store.lock().expect("clipboard memory lock").push(text.to_string());
+                store
+                    .lock()
+                    .expect("clipboard memory lock")
+                    .push(text.to_string());
                 Ok(ClipboardResult {
                     backend: ClipboardBackend::Memory,
                     bytes: text.len(),
