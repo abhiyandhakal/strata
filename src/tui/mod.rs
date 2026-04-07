@@ -15,7 +15,7 @@ use crossterm::terminal::{
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -438,7 +438,7 @@ struct HitRegion {
     target: HitTarget,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum HitTarget {
     ToolbarSave,
     ToolbarRunAll,
@@ -576,6 +576,7 @@ pub struct App {
     ex_command: Option<ExCommandState>,
     pending_modal: Option<PendingModal>,
     last_saved_snapshot: String,
+    active_hit_target: Option<(HitTarget, Instant)>,
 }
 
 impl App {
@@ -661,6 +662,7 @@ impl App {
             ex_command: None,
             pending_modal: None,
             last_saved_snapshot: String::new(),
+            active_hit_target: None,
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
@@ -1040,27 +1042,45 @@ impl App {
         let kernel_button = format!("[Kernel: {kernel_label}]");
         let environment_button = format!("[Env: {environment_label}]");
         let mut spans = vec![
-            Span::styled("[Save]", self.theme.style("toolbar.button.save")),
+            Span::styled(
+                "[Save]",
+                self.button_style("toolbar.button.save", &HitTarget::ToolbarSave),
+            ),
             Span::raw(" "),
-            Span::styled("[Run All]", self.theme.style("toolbar.button.run_all")),
+            Span::styled(
+                "[Run All]",
+                self.button_style("toolbar.button.run_all", &HitTarget::ToolbarRunAll),
+            ),
             Span::raw(" "),
-            Span::styled("[Restart]", self.theme.style("toolbar.button.restart")),
+            Span::styled(
+                "[Restart]",
+                self.button_style("toolbar.button.restart", &HitTarget::ToolbarRestart),
+            ),
             Span::raw(" "),
             Span::styled(
                 kernel_button.clone(),
-                self.theme.style("toolbar.button.add_code"),
+                self.button_style("toolbar.button.add_code", &HitTarget::ToolbarCycleKernel),
             ),
             Span::raw(" "),
             Span::styled(
                 environment_button.clone(),
-                self.theme.style("toolbar.button.add_markdown"),
+                self.button_style(
+                    "toolbar.button.add_markdown",
+                    &HitTarget::ToolbarCycleEnvironment,
+                ),
             ),
             Span::raw(" "),
-            Span::styled("[+ Code]", self.theme.style("toolbar.button.add_code")),
+            Span::styled(
+                "[+ Code]",
+                self.button_style("toolbar.button.add_code", &HitTarget::ToolbarAddCode),
+            ),
             Span::raw(" "),
             Span::styled(
                 "[+ Markdown]",
-                self.theme.style("toolbar.button.add_markdown"),
+                self.button_style(
+                    "toolbar.button.add_markdown",
+                    &HitTarget::ToolbarAddMarkdown,
+                ),
             ),
         ];
         let toolbar = Paragraph::new(Line::from(std::mem::take(&mut spans)));
@@ -1295,7 +1315,10 @@ impl App {
         let body_collapsed = self.cell_mode(cell).body_collapsed;
         let mut chrome_spans = vec![Span::styled(prompt, chrome_style), Span::raw(" ")];
         if self.is_cell_runnable(cell) {
-            chrome_spans.push(Span::styled("[Run]", self.theme.style("cell.button.run")));
+            chrome_spans.push(Span::styled(
+                "[Run]",
+                self.button_style("cell.button.run", &HitTarget::CellRun(index)),
+            ));
             chrome_spans.push(Span::raw(" "));
         } else if matches!(cell.kind, CellKind::Code) {
             chrome_spans.push(Span::styled(
@@ -1315,19 +1338,26 @@ impl App {
                 }
                 _ => "[Edit]",
             },
-            self.theme.style("cell.button.edit"),
+            if cell.kind == CellKind::Markdown {
+                self.button_style("cell.button.edit", &HitTarget::CellToggleRender(index))
+            } else {
+                self.button_style("cell.button.edit", &HitTarget::CellEdit(index))
+            },
         ));
         chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled("[+]", self.theme.style("cell.button.add")));
+        chrome_spans.push(Span::styled(
+            "[+]",
+            self.button_style("cell.button.add", &HitTarget::CellInsertBelow(index)),
+        ));
         chrome_spans.push(Span::raw(" "));
         chrome_spans.push(Span::styled(
             if body_collapsed { "[Unfold]" } else { "[Fold]" },
-            self.theme.style("cell.button.edit"),
+            self.button_style("cell.button.edit", &HitTarget::CellToggleBody(index)),
         ));
         chrome_spans.push(Span::raw(" "));
         chrome_spans.push(Span::styled(
             "[Del]",
-            self.theme.style("cell.button.delete"),
+            self.button_style("cell.button.delete", &HitTarget::CellDelete(index)),
         ));
         if !cell.outputs.is_empty() {
             chrome_spans.push(Span::raw(" "));
@@ -1337,13 +1367,16 @@ impl App {
                 } else {
                     "[Hide Out]"
                 },
-                self.theme.style("cell.button.output"),
+                self.button_style("cell.button.output", &HitTarget::CellToggleOutput(index)),
             ));
             if self.first_image_output(cell).is_some() {
                 chrome_spans.push(Span::raw(" "));
                 chrome_spans.push(Span::styled(
                     "[Open]",
-                    self.theme.style("toolbar.button.add_markdown"),
+                    self.button_style(
+                        "toolbar.button.add_markdown",
+                        &HitTarget::CellOpenImage(index),
+                    ),
                 ));
             }
         }
@@ -1939,6 +1972,7 @@ impl App {
     }
 
     fn activate_hit_target(&mut self, target: HitTarget, column: u16, row: u16) -> Result<()> {
+        self.set_active_hit_target(target.clone());
         match target {
             HitTarget::ToolbarSave => self.save_all()?,
             HitTarget::ToolbarRunAll => self.run_all_cells()?,
@@ -2021,6 +2055,29 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn set_active_hit_target(&mut self, target: HitTarget) {
+        self.active_hit_target = Some((target, Instant::now()));
+    }
+
+    fn is_target_active(&self, target: &HitTarget) -> bool {
+        self.active_hit_target
+            .as_ref()
+            .is_some_and(|(active, since)| {
+                active == target && since.elapsed() <= Duration::from_millis(180)
+            })
+    }
+
+    fn button_style(&self, key: &str, target: &HitTarget) -> Style {
+        let style = self.theme.style(key);
+        if self.is_target_active(target) {
+            style
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
     }
 
     fn request_quit(&mut self) -> Result<bool> {
@@ -3996,6 +4053,18 @@ mod tests {
             .unwrap();
 
         assert!(app.cell_mode(&app.notebook.cells[0]).body_collapsed);
+    }
+
+    #[test]
+    fn clicking_button_marks_it_temporarily_active() {
+        let notebook = Notebook::new("Buttons").with_cells(vec![Cell::markdown("hello")]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.activate_hit_target(HitTarget::CellToggleBody(0), 0, 0)
+            .unwrap();
+
+        assert!(app.is_target_active(&HitTarget::CellToggleBody(0)));
     }
 
     #[test]
