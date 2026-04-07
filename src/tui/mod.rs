@@ -1242,6 +1242,18 @@ impl App {
             CellKind::Code => render_code_block(cell, &self.theme),
             _ => Text::from(cell.source.clone()),
         };
+        let title = match cell.kind {
+            CellKind::Code => format!("code {} (continued)", cell.language.fence_name()),
+            CellKind::Markdown => {
+                if rendered {
+                    "markdown rendered (continued)".to_string()
+                } else {
+                    "markdown (continued)".to_string()
+                }
+            }
+            CellKind::Raw => "raw (continued)".to_string(),
+            CellKind::Ai => "ai (continued)".to_string(),
+        };
         let mut lines = Vec::new();
         lines.push(Line::from(prompt));
         lines.extend(body_text.lines);
@@ -1253,17 +1265,22 @@ impl App {
             lines
                 .into_iter()
                 .skip(top_skip as usize)
-                .take(area.height as usize)
+                .take(area.height.saturating_sub(2) as usize)
                 .collect::<Vec<_>>(),
         );
-        frame.render_widget(
-            Paragraph::new(text).style(style).block(
-                Block::default()
-                    .borders(Borders::LEFT | Borders::RIGHT)
-                    .border_style(border),
-            ),
-            area,
-        );
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .border_style(border)
+            .style(style)
+            .title(title);
+        frame.render_widget(block, area);
+        let inner = shrink(area, 1);
+        if inner.width > 0 && inner.height > 0 {
+            frame.render_widget(
+                Paragraph::new(text).style(style).wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
     }
 
     fn draw_cell(
@@ -4094,6 +4111,32 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "d" && cell.fg != ratatui::style::Color::Reset)
         );
+    }
+
+    #[test]
+    fn clipped_cells_render_continued_shell_header() {
+        let source = (0..20)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook =
+            Notebook::new("ClipShell").with_cells(vec![Cell::code(Language::Python, source)]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.scroll_offset = 2;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("continued"));
     }
 
     #[test]
