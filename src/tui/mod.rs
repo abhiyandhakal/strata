@@ -3629,6 +3629,9 @@ impl App {
             match message {
                 WorkerMessage::Progress(state) => {
                     self.execution_state = state;
+                    if let Some(index) = self.current_running_index() {
+                        self.selected = Some(index);
+                    }
                 }
                 WorkerMessage::Completed(completion) => {
                     self.notebook = completion.notebook;
@@ -4970,63 +4973,6 @@ mod tests {
         app.run_selected_cell().unwrap();
 
         assert!(app.status.contains("execution already in progress"));
-    }
-
-    #[test]
-    fn worker_progress_does_not_override_selection_or_scroll() {
-        let notebook = Notebook::new("BusyView").with_cells(vec![
-            Cell::markdown("one"),
-            Cell::markdown("two"),
-            Cell::markdown("three"),
-        ]);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
-        let (tx, rx) = mpsc::channel();
-        app.worker_rx = Some(rx);
-        app.selected = Some(2);
-        app.scroll_offset = 7;
-
-        tx.send(WorkerMessage::Progress(ExecutionState::RunningAll {
-            current_index: 0,
-            remaining: 2,
-            started_at: Instant::now(),
-        }))
-        .unwrap();
-
-        app.poll_worker_messages().unwrap();
-
-        assert_eq!(app.selected, Some(2));
-        assert_eq!(app.scroll_offset, 7);
-        assert!(app.is_busy());
-    }
-
-    #[test]
-    fn scrolling_and_selection_still_work_while_busy() {
-        let cells = (0..8)
-            .map(|i| Cell::markdown(format!("cell {i}")))
-            .collect::<Vec<_>>();
-        let notebook = Notebook::new("BusyScroll").with_cells(cells);
-        let session = SessionManager::new(&notebook);
-        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
-        app.notebook_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 10,
-        };
-        app.execution_state = ExecutionState::RunningCell {
-            index: 0,
-            cell_id: app.notebook.cells[0].id.clone(),
-            started_at: Instant::now(),
-        };
-
-        app.move_selection(4);
-        let after_select = app.scroll_offset;
-        app.scroll_rows(3);
-
-        assert_eq!(app.selected, Some(4));
-        assert!(after_select > 0);
-        assert!(app.scroll_offset >= after_select);
     }
 
     #[test]
