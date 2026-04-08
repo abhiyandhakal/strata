@@ -558,6 +558,20 @@ struct RenderedMarkdown {
     blocks: Vec<MarkdownBlock>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedTableOutput {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    footer: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OutputUiState {
+    table_expanded: bool,
+    table_scroll_x: usize,
+    copy_menu_open: bool,
+}
+
 impl RenderedMarkdown {
     fn plain_lines(&self) -> Vec<String> {
         self.blocks
@@ -567,6 +581,28 @@ impl RenderedMarkdown {
                 MarkdownBlock::Image { plain, .. } => plain.clone(),
             })
             .collect()
+    }
+}
+
+impl ParsedTableOutput {
+    fn to_delimited(&self, delimiter: char) -> String {
+        let mut lines = Vec::with_capacity(self.rows.len().saturating_add(1));
+        lines.push(
+            self.headers
+                .iter()
+                .map(|value| escape_delimited(value, delimiter))
+                .collect::<Vec<_>>()
+                .join(&delimiter.to_string()),
+        );
+        for row in &self.rows {
+            lines.push(
+                row.iter()
+                    .map(|value| escape_delimited(value, delimiter))
+                    .collect::<Vec<_>>()
+                    .join(&delimiter.to_string()),
+            );
+        }
+        lines.join("\n")
     }
 }
 
@@ -622,6 +658,8 @@ pub struct App {
     active_hit_target: Option<(HitTarget, Instant)>,
     execution_state: ExecutionState,
     worker_rx: Option<Receiver<WorkerMessage>>,
+    output_states: BTreeMap<String, OutputUiState>,
+    active_output_index: Option<usize>,
 }
 
 impl App {
@@ -710,6 +748,8 @@ impl App {
             active_hit_target: None,
             execution_state: ExecutionState::Idle,
             worker_rx: None,
+            output_states: BTreeMap::new(),
+            active_output_index: None,
         };
         app.ensure_notebook_not_empty();
         app.load_selected_into_editor();
@@ -3847,6 +3887,107 @@ fn output_text(cell: &Cell, notebook_path: Option<&std::path::Path>) -> String {
     chunks.join("\n\n")
 }
 
+fn parse_display_table(output: &CellOutput) -> Option<ParsedTableOutput> {
+    let CellOutput::DisplayData { data, .. } = output else {
+        return None;
+    };
+    let text = data.get("text/plain")?.as_str()?;
+    parse_table_text(text)
+}
+
+fn parse_table_text(text: &str) -> Option<ParsedTableOutput> {
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    while matches!(lines.first(), Some(line) if line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while matches!(lines.last(), Some(line) if line.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.len() < 2 {
+        return None;
+    }
+
+    let footer = lines
+        .last()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.contains(" rows x ")
+        })
+        .cloned();
+    if footer.is_some() {
+        lines.pop();
+    }
+    if lines.len() < 2 {
+        return None;
+    }
+
+    let header_line = lines.first()?.clone();
+    let mut headers = split_table_line(&header_line);
+    let rows = lines
+        .iter()
+        .skip(1)
+        .map(|line| split_table_line(line))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+
+    let max_row_len = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if headers.len() + 1 == max_row_len {
+        headers.insert(0, String::new());
+    }
+    if headers.len() < 2 || headers.len() != max_row_len {
+        return None;
+    }
+    if rows.iter().any(|row| row.len() != headers.len()) {
+        return None;
+    }
+
+    Some(ParsedTableOutput {
+        headers,
+        rows,
+        footer,
+    })
+}
+
+fn split_table_line(line: &str) -> Vec<String> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == ' ' {
+            let mut run = 1usize;
+            while index + run < chars.len() && chars[index + run] == ' ' {
+                run += 1;
+            }
+            if run >= 2 {
+                if !current.trim().is_empty() || !cells.is_empty() {
+                    cells.push(current.trim().to_string());
+                    current.clear();
+                }
+                index += run;
+                continue;
+            }
+        }
+        current.push(ch);
+        index += 1;
+    }
+    if !current.trim().is_empty() || !cells.is_empty() {
+        cells.push(current.trim().to_string());
+    }
+    cells
+}
+
+fn escape_delimited(value: &str, delimiter: char) -> String {
+    if value.contains(delimiter) || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn extract_selected_text(lines: &[String], selection: MouseTextSelection) -> Option<String> {
     let (start, end) = selection.normalized();
     if start.row >= lines.len() || end.row >= lines.len() {
@@ -4826,6 +4967,39 @@ mod tests {
                 .rev()
                 .take(4)
                 .any(|row| row.contains("In [") || row.contains("line_0") || row.contains("code"))
+        );
+    }
+
+    #[test]
+    fn parses_display_table_from_pandas_text() {
+        let parsed = parse_table_text(
+            "      method  n_runs  n_unique_outcomes  ...  silhouette_mean  ari_mean  nmi_mean\n0   kmeans++      20                 11  ...         0.547732  0.693490  0.733839\n1      maxmin      20                  6  ...         0.552331  0.720069  0.753296\n2      random      20                 12  ...         0.546949  0.678792  0.725237\n3 region_mean       1                  1  ...         0.551192  0.716342  0.741912\n\n[4 rows x 16 columns]",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.headers[0], "");
+        assert_eq!(parsed.headers[1], "method");
+        assert_eq!(parsed.rows.len(), 4);
+        assert_eq!(parsed.rows[0][1], "kmeans++");
+        assert_eq!(parsed.footer.as_deref(), Some("[4 rows x 16 columns]"));
+    }
+
+    #[test]
+    fn serializes_parsed_table_as_csv_and_tsv() {
+        let table = ParsedTableOutput {
+            headers: vec!["".to_string(), "method".to_string(), "score".to_string()],
+            rows: vec![vec![
+                "0".to_string(),
+                "region_mean".to_string(),
+                "0.75".to_string(),
+            ]],
+            footer: Some("[1 rows x 3 columns]".to_string()),
+        };
+
+        assert_eq!(table.to_delimited(','), ",method,score\n0,region_mean,0.75");
+        assert_eq!(
+            table.to_delimited('\t'),
+            "\tmethod\tscore\n0\tregion_mean\t0.75"
         );
     }
 
