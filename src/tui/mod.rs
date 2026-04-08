@@ -1429,7 +1429,7 @@ impl App {
         let visible_line_count = if compact {
             area.height as usize
         } else {
-            area.height.saturating_sub(2) as usize
+            area.height.saturating_sub(3) as usize
         };
         let text = Text::from(
             lines
@@ -1449,13 +1449,28 @@ impl App {
             );
             return;
         }
-        let block = Block::default()
+        let outer = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .border_style(border)
+            .style(style);
+        frame.render_widget(outer, area);
+        let shell_inner = shrink(area, 1);
+        if shell_inner.width == 0 || shell_inner.height == 0 {
+            return;
+        }
+        let inner_block_area = Rect {
+            x: shell_inner.x,
+            y: shell_inner.y,
+            width: shell_inner.width,
+            height: shell_inner.height,
+        };
+        let inner_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(border)
             .style(style)
             .title(title);
-        frame.render_widget(block, area);
-        let inner = shrink(area, 1);
+        frame.render_widget(inner_block, inner_block_area);
+        let inner = shrink(inner_block_area, 1);
         if inner.width > 0 && inner.height > 0 {
             frame.render_widget(
                 Paragraph::new(text).style(style).wrap(Wrap { trim: false }),
@@ -4489,6 +4504,40 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
+        assert!(rendered.contains("continued"));
+    }
+
+    #[test]
+    fn top_clipped_cells_keep_outer_shell() {
+        let source = (0..20)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook =
+            Notebook::new("ClipShell").with_cells(vec![Cell::code(Language::Python, source)]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.scroll_offset = 2;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let first_row = buffer
+            .content()
+            .chunks(80)
+            .next()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_ne!(first_row.chars().next(), Some('c'));
         assert!(rendered.contains("continued"));
     }
 
