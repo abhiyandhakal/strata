@@ -1347,6 +1347,10 @@ impl App {
         index: usize,
         cell: &Cell,
     ) {
+        let inner = shrink(area, 1);
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
         let selected = self.selected == Some(index);
         let shell_style = if selected {
             self.theme.style("cell.shell.selected")
@@ -1365,10 +1369,6 @@ impl App {
                 .style(shell_style),
             area,
         );
-        let inner = shrink(area, 1);
-        if inner.height < 3 || inner.width < 10 {
-            return;
-        }
         let chrome_style = if selected {
             self.theme.style("cell.prompt.selected")
         } else {
