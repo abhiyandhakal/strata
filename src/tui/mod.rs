@@ -22,6 +22,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
+use serde_json::Value;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
 use crate::clipboard::{Clipboard, ClipboardResult};
@@ -571,6 +572,8 @@ struct ParsedTableOutput {
     rows: Vec<Vec<String>>,
     footer: Option<String>,
 }
+
+const STRATA_TABLE_MIME: &str = "application/x-strata-table+json";
 
 #[derive(Clone, Debug, Default)]
 struct OutputUiState {
@@ -1491,19 +1494,27 @@ impl App {
         body_lines.push(Line::from(self.cell_prompt(index, cell)));
         body_lines.extend(body_text.lines);
         let output_visible = !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed;
-        let output_text = if output_visible {
-            Some(render_output_block(cell, &self.theme))
+        let output_total_lines = if output_visible {
+            cell.outputs
+                .iter()
+                .enumerate()
+                .map(|(output_index, output)| {
+                    self.clipped_output_line_count(cell, output_index, output, area.width)
+                })
+                .sum::<usize>()
+                .saturating_add(cell.outputs.len().saturating_sub(1))
         } else {
-            None
+            0
         };
-        let output_total_lines = output_text
-            .as_ref()
-            .map(|text| text.lines.len().saturating_add(1))
-            .unwrap_or(0);
         let mut lines = body_lines.clone();
-        if let Some(output_text) = &output_text {
-            lines.push(Line::from("Output"));
-            lines.extend(output_text.lines.clone());
+        if output_visible {
+            for (output_index, output) in cell.outputs.iter().enumerate() {
+                lines.push(Line::from("Output"));
+                lines.extend(self.clipped_output_lines(cell, output_index, output, area.width));
+                if output_index + 1 < cell.outputs.len() {
+                    lines.push(Line::from(""));
+                }
+            }
         }
         let compact = area.width < 10 || area.height < if bottom_clipped { 3 } else { 5 };
         let visible_line_count = if compact {
@@ -1565,12 +1576,19 @@ impl App {
             let has_output_fragment = output_visible && output_skip < output_total_lines;
 
             if has_output_fragment {
-                let output_content_skip = output_skip.saturating_sub(1);
-                let output_text = output_text.unwrap();
-                let available_output_lines = output_text
-                    .lines
-                    .len()
-                    .saturating_sub(output_content_skip)
+                let visible_outputs = self.visible_clipped_outputs(cell, output_skip, inner.width);
+                let available_output_lines = visible_outputs
+                    .iter()
+                    .map(|(output_index, content_skip)| {
+                        self.clipped_output_line_count(
+                            cell,
+                            *output_index,
+                            &cell.outputs[*output_index],
+                            inner.width,
+                        )
+                        .saturating_sub(*content_skip)
+                    })
+                    .sum::<usize>()
                     .max(1);
                 let output_block_height =
                     (available_output_lines as u16 + 2).min(inner.height).max(3);
@@ -1606,26 +1624,7 @@ impl App {
                         width: inner.width.saturating_sub(2),
                         height: inner.height.saturating_sub(body_height),
                     };
-                    frame.render_widget(
-                        Paragraph::new(Text::from(
-                            output_text
-                                .lines
-                                .into_iter()
-                                .skip(output_content_skip)
-                                .take(output_area.height.saturating_sub(2) as usize)
-                                .collect::<Vec<_>>(),
-                        ))
-                        .style(self.theme.style("output.block"))
-                        .wrap(Wrap { trim: false })
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .style(self.theme.style("output.block"))
-                                .border_style(self.theme.style("output.border"))
-                                .title("Output"),
-                        ),
-                        output_area,
-                    );
+                    self.render_clipped_outputs(frame, output_area, index, cell, &visible_outputs);
                     return;
                 }
 
@@ -1635,26 +1634,7 @@ impl App {
                     width: inner.width.saturating_sub(2),
                     height: inner.height,
                 };
-                frame.render_widget(
-                    Paragraph::new(Text::from(
-                        output_text
-                            .lines
-                            .into_iter()
-                            .skip(output_content_skip)
-                            .take(output_area.height.saturating_sub(2) as usize)
-                            .collect::<Vec<_>>(),
-                    ))
-                    .style(self.theme.style("output.block"))
-                    .wrap(Wrap { trim: false })
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .style(self.theme.style("output.block"))
-                            .border_style(self.theme.style("output.border"))
-                            .title("Output"),
-                    ),
-                    output_area,
-                );
+                self.render_clipped_outputs(frame, output_area, index, cell, &visible_outputs);
                 return;
             }
 
@@ -2045,6 +2025,171 @@ impl App {
             cell_index,
             target: CopyTarget::CellOutput,
         });
+    }
+
+    fn clipped_output_line_count(
+        &self,
+        cell: &Cell,
+        output_index: usize,
+        output: &CellOutput,
+        width: u16,
+    ) -> usize {
+        if let Some(table) = parse_display_table(output) {
+            let state = self.output_state(&cell.id, output_index);
+            let preview_rows = if state.table_expanded {
+                table.rows.len()
+            } else {
+                table.rows.len().min(4)
+            };
+            return render_table_grid_lines(&table, preview_rows, state.table_scroll_x, width)
+                .len()
+                .saturating_add(1);
+        }
+        output_lines(output, &self.theme).len().saturating_add(1)
+    }
+
+    fn clipped_output_lines(
+        &self,
+        cell: &Cell,
+        output_index: usize,
+        output: &CellOutput,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        if let Some(table) = parse_display_table(output) {
+            let state = self.output_state(&cell.id, output_index);
+            let preview_rows = if state.table_expanded {
+                table.rows.len()
+            } else {
+                table.rows.len().min(4)
+            };
+            return render_table_grid_lines(&table, preview_rows, state.table_scroll_x, width);
+        }
+        output_lines(output, &self.theme)
+    }
+
+    fn visible_clipped_outputs(
+        &self,
+        cell: &Cell,
+        mut output_skip: usize,
+        width: u16,
+    ) -> Vec<(usize, usize)> {
+        let mut visible = Vec::new();
+        for (output_index, output) in cell.outputs.iter().enumerate() {
+            let content_lines = self.clipped_output_line_count(cell, output_index, output, width);
+            let total_lines = content_lines + usize::from(output_index + 1 < cell.outputs.len());
+            if output_skip >= total_lines {
+                output_skip -= total_lines;
+                continue;
+            }
+            visible.push((output_index, output_skip));
+            for trailing in output_index + 1..cell.outputs.len() {
+                visible.push((trailing, 0));
+            }
+            break;
+        }
+        visible
+    }
+
+    fn render_clipped_outputs(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        cell_index: usize,
+        cell: &Cell,
+        visible_outputs: &[(usize, usize)],
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let mut y = area.y;
+        let mut remaining = area.height;
+        for (position, (output_index, content_skip)) in visible_outputs.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let output = &cell.outputs[*output_index];
+            let line_count =
+                self.clipped_output_line_count(cell, *output_index, output, area.width);
+            let visible_lines = line_count.saturating_sub(*content_skip).max(1);
+            let block_height = (visible_lines as u16 + 2).min(remaining).max(3);
+            let output_area = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: block_height,
+            };
+            if *content_skip == 0 {
+                if let Some(table) = parse_display_table(output) {
+                    self.render_table_output(frame, output_area, cell_index, *output_index, &table);
+                } else {
+                    let output_selected = self.selected == Some(cell_index)
+                        && self.copy_target == CopyTarget::CellOutput
+                        && self.active_output_index.is_none();
+                    let output_text = Text::from(output_lines(output, &self.theme));
+                    let output_text = if output_selected {
+                        apply_mouse_selection_to_text(
+                            output_text,
+                            self.mouse_text_selection_for(cell_index, CopyTarget::CellOutput),
+                            self.theme.style("cell.prompt.selected"),
+                        )
+                    } else {
+                        output_text
+                    };
+                    frame.render_widget(
+                        Paragraph::new(output_text)
+                            .style(if output_selected {
+                                self.theme.style("cell.shell.selected")
+                            } else {
+                                self.theme.style("output.block")
+                            })
+                            .wrap(Wrap { trim: false })
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .style(if output_selected {
+                                        self.theme.style("cell.shell.selected")
+                                    } else {
+                                        self.theme.style("output.block")
+                                    })
+                                    .border_style(if output_selected {
+                                        self.theme.style("cell.border.selected")
+                                    } else {
+                                        self.theme.style("output.border")
+                                    })
+                                    .title("Output"),
+                            ),
+                        output_area,
+                    );
+                }
+            } else {
+                let output_fragment = self
+                    .clipped_output_lines(cell, *output_index, output, area.width)
+                    .into_iter()
+                    .skip(*content_skip)
+                    .take(output_area.height.saturating_sub(2) as usize)
+                    .collect::<Vec<_>>();
+                frame.render_widget(
+                    Paragraph::new(Text::from(output_fragment))
+                        .style(self.theme.style("output.block"))
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .style(self.theme.style("output.block"))
+                                .border_style(self.theme.style("output.border"))
+                                .title("Output"),
+                        ),
+                    output_area,
+                );
+            }
+
+            y = y.saturating_add(block_height);
+            remaining = remaining.saturating_sub(block_height);
+            if position + 1 < visible_outputs.len() && remaining > 0 {
+                y = y.saturating_add(1);
+                remaining = remaining.saturating_sub(1);
+            }
+        }
     }
 
     fn register_table_control_hits(
@@ -4230,17 +4375,6 @@ fn output_lines(output: &CellOutput, theme: &Theme) -> Vec<Line<'static>> {
     }
 }
 
-fn render_output_block(cell: &Cell, theme: &Theme) -> Text<'static> {
-    let mut lines = Vec::new();
-    for output in &cell.outputs {
-        lines.extend(output_lines(output, theme));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from("No output."));
-    }
-    Text::from(lines)
-}
-
 fn slice_chars(input: &str, start: usize, width: usize) -> String {
     input.chars().skip(start).take(width).collect()
 }
@@ -4376,8 +4510,49 @@ fn parse_display_table(output: &CellOutput) -> Option<ParsedTableOutput> {
     let CellOutput::DisplayData { data, .. } = output else {
         return None;
     };
+    if let Some(structured) = data.get(STRATA_TABLE_MIME) {
+        if let Some(table) = parse_structured_table(structured) {
+            return Some(table);
+        }
+    }
     let text = data.get("text/plain")?.as_str()?;
     parse_table_text(text)
+}
+
+fn parse_structured_table(value: &Value) -> Option<ParsedTableOutput> {
+    let object = value.as_object()?;
+    let headers = object
+        .get("headers")?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    let rows = object
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().unwrap_or_default().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    if headers.is_empty() || rows.iter().any(|row| row.len() != headers.len()) {
+        return None;
+    }
+    Some(ParsedTableOutput {
+        headers,
+        rows,
+        footer: object
+            .get("footer")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    })
 }
 
 fn parse_table_text(text: &str) -> Option<ParsedTableOutput> {
@@ -5257,7 +5432,7 @@ mod tests {
 
     #[test]
     fn clipped_cells_render_continued_shell_header() {
-        let source = (0..20)
+        let source = (0..6)
             .map(|index| format!("line_{index}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -5380,7 +5555,7 @@ mod tests {
         let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        app.scroll_offset = 8;
+        app.scroll_offset = 21;
 
         terminal.draw(|frame| app.draw(frame)).unwrap();
 
@@ -5488,6 +5663,93 @@ mod tests {
 
         let state = app.output_state(&app.notebook.cells[0].id, 0);
         assert_eq!(state.table_scroll_x, 0);
+    }
+
+    #[test]
+    fn structured_table_payload_is_preferred_over_plain_text_truncation() {
+        let mut cell = Cell::code(Language::Python, "display(df)");
+        cell.outputs = vec![CellOutput::DisplayData {
+            data: BTreeMap::from([
+                (
+                    STRATA_TABLE_MIME.to_string(),
+                    serde_json::json!({
+                        "headers": ["", "method", "score"],
+                        "rows": [
+                            ["0", "region_mean", "0.75"],
+                            ["1", "random", "0.62"]
+                        ],
+                        "footer": "[2 rows x 2 columns]"
+                    }),
+                ),
+                (
+                    "text/plain".to_string(),
+                    Value::String("      method  score\n0 region_mean  ...".to_string()),
+                ),
+            ]),
+            metadata: BTreeMap::new(),
+        }];
+        let notebook = Notebook::new("StructuredTable").with_cells(vec![cell]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let cell_id = app.notebook.cells[0].id.clone();
+        app.output_state_mut(&cell_id, 0).table_expanded = true;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("region_mean"));
+        assert!(rendered.contains("random"));
+        assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn top_clipped_structured_table_stays_formatted() {
+        let source = (0..20)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut cell = Cell::code(Language::Python, source);
+        cell.outputs = vec![CellOutput::DisplayData {
+            data: BTreeMap::from([(
+                STRATA_TABLE_MIME.to_string(),
+                serde_json::json!({
+                    "headers": ["", "method", "score"],
+                    "rows": [
+                        ["0", "region_mean", "0.75"],
+                        ["1", "random", "0.62"]
+                    ],
+                    "footer": "[2 rows x 2 columns]"
+                }),
+            )]),
+            metadata: BTreeMap::new(),
+        }];
+        let notebook = Notebook::new("ClipStructuredTable").with_cells(vec![cell]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.scroll_offset = 2;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Output"));
+        assert!(rendered.contains("┌"));
+        assert!(rendered.contains("region_mean"));
     }
 
     #[test]
