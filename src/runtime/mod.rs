@@ -51,6 +51,13 @@ pub struct KernelExecution {
     pub exit_code: i32,
     pub bridges: Vec<BridgeValue>,
     pub artifacts: Vec<ArtifactRef>,
+    pub displays: Vec<KernelDisplay>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDisplay {
+    pub data: BTreeMap<String, serde_json::Value>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 pub trait KernelAdapter: Send {
@@ -351,6 +358,16 @@ struct WorkerResponse {
     error_output: String,
     exit_code: i32,
     bridges: Vec<WorkerBridge>,
+    #[serde(default)]
+    displays: Vec<WorkerDisplay>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerDisplay {
+    #[serde(default)]
+    data: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    metadata: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,6 +506,14 @@ impl KernelAdapter for WorkerKernelAdapter {
             exit_code: response.exit_code,
             bridges,
             artifacts,
+            displays: response
+                .displays
+                .into_iter()
+                .map(|display| KernelDisplay {
+                    data: display.data,
+                    metadata: display.metadata,
+                })
+                .collect(),
         })
     }
 
@@ -821,6 +846,7 @@ pub fn summarize_records(records: &[ExecutionRecord]) -> String {
 
 fn build_cell_outputs(execution_count: u32, execution: &KernelExecution) -> Vec<CellOutput> {
     let mut outputs = Vec::new();
+    outputs.extend(build_display_outputs(&execution.displays));
     if let Some(image_output) = build_image_output(execution_count, execution) {
         outputs.push(image_output);
     }
@@ -850,6 +876,17 @@ fn build_cell_outputs(execution_count: u32, execution: &KernelExecution) -> Vec<
         });
     }
     outputs
+}
+
+fn build_display_outputs(displays: &[KernelDisplay]) -> Vec<CellOutput> {
+    displays
+        .iter()
+        .filter(|display| !display.data.is_empty())
+        .map(|display| CellOutput::DisplayData {
+            data: display.data.clone(),
+            metadata: display.metadata.clone(),
+        })
+        .collect()
 }
 
 fn build_image_output(_execution_count: u32, execution: &KernelExecution) -> Option<CellOutput> {
@@ -1126,9 +1163,34 @@ mod tests {
             exit_code: 0,
             bridges: Vec::new(),
             artifacts: Vec::new(),
+            displays: Vec::new(),
         };
         let output = build_image_output(1, &execution);
         assert!(output.unwrap().image_info().is_some());
+    }
+
+    #[test]
+    fn python_display_creates_display_data_output() {
+        let notebook = Notebook::new("Display");
+        let mut session = SessionManager::new(&notebook);
+        session
+            .register_kernel(Box::new(PythonKernelAdapter::default()))
+            .unwrap();
+
+        let record = session
+            .run_code_cell(&Cell::code(
+                Language::Python,
+                "display('hello from display')",
+            ))
+            .unwrap();
+
+        assert!(record.error_output.is_empty());
+        assert!(record.outputs.iter().any(|output| matches!(
+            output,
+            CellOutput::DisplayData { data, .. }
+                if data.get("text/plain")
+                    == Some(&serde_json::Value::String("hello from display".to_string()))
+        )));
     }
 
     #[test]
