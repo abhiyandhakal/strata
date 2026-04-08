@@ -1241,9 +1241,7 @@ impl App {
                 height,
             };
             let top_skip = visible_top.saturating_sub(cell_top);
-            if top_skip == 0 && visible_bottom < cell_bottom {
-                self.draw_bottom_clipped_cell(frame, cell_area, index, &cell);
-            } else if top_skip == 0 {
+            if top_skip == 0 {
                 self.draw_cell(frame, area, cell_area, index, &cell);
             } else {
                 self.draw_clipped_cell(frame, cell_area, index, &cell, top_skip);
@@ -1372,110 +1370,6 @@ impl App {
         }
     }
 
-    fn draw_bottom_clipped_cell(
-        &mut self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        index: usize,
-        cell: &Cell,
-    ) {
-        let selected = self.selected == Some(index);
-        let shell_style = if selected {
-            self.theme.style("cell.shell.selected")
-        } else {
-            self.theme.style("cell.shell")
-        };
-        let border_style = if selected {
-            self.theme.style("cell.border.selected")
-        } else {
-            self.theme.style("cell.border")
-        };
-        let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
-        let chrome = self.build_cell_chrome(index, cell, rendered);
-        let title = self.cell_title(cell, rendered);
-        let body_collapsed = self.cell_mode(cell).body_collapsed;
-
-        self.hit_regions.push(HitRegion {
-            rect: area,
-            target: HitTarget::CellSelect(index),
-        });
-
-        if area.height == 0 || area.width == 0 {
-            return;
-        }
-        if area.height == 1 || area.width < 10 {
-            frame.render_widget(Paragraph::new(chrome).style(shell_style), area);
-            return;
-        }
-
-        frame.render_widget(
-            Block::default()
-                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                .border_style(border_style)
-                .style(shell_style),
-            area,
-        );
-        let inner = shrink(area, 1);
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
-
-        let chrome_area = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(Paragraph::new(chrome), chrome_area);
-        self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
-
-        let remaining_height = inner.height.saturating_sub(1);
-        if remaining_height == 0 {
-            return;
-        }
-
-        let mut lines = vec![Line::from(title)];
-        if body_collapsed {
-            lines.push(Line::from(vec![Span::styled(
-                "... cell body collapsed ...",
-                self.theme.style("output.stream.label"),
-            )]));
-        } else {
-            lines.extend(self.body_text(cell, rendered).lines);
-        }
-        if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
-            lines.push(Line::from("Output"));
-            lines.extend(render_output_block(cell, &self.theme).lines);
-        }
-
-        let content_area = Rect {
-            x: inner.x,
-            y: inner.y + 1,
-            width: inner.width,
-            height: remaining_height,
-        };
-        frame.render_widget(
-            Paragraph::new(Text::from(
-                lines
-                    .into_iter()
-                    .take(remaining_height as usize)
-                    .collect::<Vec<_>>(),
-            ))
-            .style(shell_style)
-            .wrap(Wrap { trim: false }),
-            content_area,
-        );
-        self.hit_regions.push(HitRegion {
-            rect: content_area,
-            target: HitTarget::CellEditor(index),
-        });
-        self.content_regions.push(ContentRegion {
-            rect: content_area,
-            cell_index: index,
-            target: CopyTarget::CellBody,
-        });
-    }
-
     fn draw_clipped_cell(
         &mut self,
         frame: &mut Frame<'_>,
@@ -1578,8 +1472,7 @@ impl App {
         index: usize,
         cell: &Cell,
     ) {
-        let inner = shrink(area, 1);
-        if inner.height < 3 || inner.width < 10 {
+        if area.height == 0 || area.width == 0 {
             return;
         }
         let selected = self.selected == Some(index);
@@ -1593,6 +1486,23 @@ impl App {
         } else {
             self.theme.style("cell.border")
         };
+        let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
+        let body_collapsed = self.cell_mode(cell).body_collapsed;
+        let chrome = self.build_cell_chrome(index, cell, rendered);
+
+        if area.height == 1 || area.width < 10 {
+            self.hit_regions.push(HitRegion {
+                rect: area,
+                target: HitTarget::CellSelect(index),
+            });
+            frame.render_widget(Paragraph::new(chrome).style(shell_style), area);
+            return;
+        }
+
+        let inner = shrink(area, 1);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
@@ -1600,9 +1510,6 @@ impl App {
                 .style(shell_style),
             area,
         );
-        let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
-        let body_collapsed = self.cell_mode(cell).body_collapsed;
-        let chrome = self.build_cell_chrome(index, cell, rendered);
         let chrome_area = Rect {
             x: inner.x,
             y: inner.y,
@@ -1617,7 +1524,13 @@ impl App {
         self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
 
         let available_body_height = inner.height.saturating_sub(1);
+        if available_body_height == 0 {
+            return;
+        }
         let input_height = self.input_height(cell, index).min(available_body_height);
+        if input_height == 0 {
+            return;
+        }
         let input_area = Rect {
             x: inner.x,
             y: inner.y + 1,
