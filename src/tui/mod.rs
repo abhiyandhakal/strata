@@ -1390,8 +1390,16 @@ impl App {
             self.theme.style("cell.border")
         };
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
-        let body_text = self.body_text(cell, rendered);
-        let title = if top_skip > 0 {
+        let body_collapsed = self.cell_mode(cell).body_collapsed;
+        let body_text = if body_collapsed {
+            Text::from(vec![Line::from(vec![Span::styled(
+                "... cell body collapsed ...",
+                self.theme.style("output.stream.label"),
+            )])])
+        } else {
+            self.body_text(cell, rendered)
+        };
+        let mut title = if top_skip > 0 {
             match cell.kind {
                 CellKind::Code => format!("code {} (continued)", cell.language.fence_name()),
                 CellKind::Markdown => {
@@ -1418,6 +1426,9 @@ impl App {
                 CellKind::Ai => "ai".to_string(),
             }
         };
+        if body_collapsed {
+            title = format!("{title} (collapsed)");
+        }
         let mut lines = Vec::new();
         lines.push(Line::from(self.cell_prompt(index, cell)));
         lines.extend(body_text.lines);
@@ -4539,6 +4550,42 @@ mod tests {
             .collect::<String>();
         assert_ne!(first_row.chars().next(), Some('c'));
         assert!(rendered.contains("continued"));
+    }
+
+    #[test]
+    fn top_clipped_collapsed_cells_do_not_render_body_source() {
+        let source = (0..20)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook =
+            Notebook::new("ClipCollapsed").with_cells(vec![Cell::code(Language::Python, source)]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.cell_modes.insert(
+            app.notebook.cells[0].id.0.clone(),
+            CellUiState {
+                rendered: false,
+                body_collapsed: true,
+                output_collapsed: false,
+            },
+        );
+        app.scroll_offset = 2;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("collapsed"));
+        assert!(!rendered.contains("line_0"));
+        assert!(!rendered.contains("line_1"));
     }
 
     #[test]
