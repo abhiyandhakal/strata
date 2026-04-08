@@ -502,6 +502,13 @@ enum HitTarget {
     MarkdownImageOpen(usize, usize, usize),
     CellInsertBelow(usize),
     CellDelete(usize),
+    OutputTableFocus(usize, usize),
+    OutputTableToggleExpand(usize, usize),
+    OutputTableScrollLeft(usize, usize),
+    OutputTableScrollRight(usize, usize),
+    OutputTableCopyMenu(usize, usize),
+    OutputTableCopyCsv(usize, usize),
+    OutputTableCopyTsv(usize, usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -970,6 +977,7 @@ impl App {
                                 .unwrap_or(false);
                             self.last_click = Some((index, Instant::now()));
                             self.selected = Some(index);
+                            self.active_output_index = None;
                             self.copy_target = CopyTarget::CellBody;
                             self.clear_mouse_text_selection();
                             self.load_selected_into_editor();
@@ -993,6 +1001,7 @@ impl App {
                         HitTarget::CellOutput(index) if self.mode == AppMode::Command => {
                             self.selected = Some(index);
                             self.copy_target = CopyTarget::CellOutput;
+                            self.active_output_index = None;
                             self.clear_mouse_text_selection();
                             self.load_selected_into_editor();
                             self.ensure_selected_visible();
@@ -1013,6 +1022,7 @@ impl App {
                         HitTarget::CellSelect(index) => {
                             self.last_click = Some((index, Instant::now()));
                             self.selected = Some(index);
+                            self.active_output_index = None;
                             self.copy_target = CopyTarget::CellBody;
                             self.clear_mouse_text_selection();
                             self.load_selected_into_editor();
@@ -1813,61 +1823,306 @@ impl App {
                 .height
                 .saturating_sub(1)
                 .saturating_sub(input_area.height);
-            let output_area = Rect {
-                x: inner.x + 2,
-                y: inner.y + 1 + input_area.height,
-                width: inner.width.saturating_sub(2),
-                height: self.output_height(cell).min(available_output_height),
-            };
-            let output_selected = selected && self.copy_target == CopyTarget::CellOutput;
-            let output_text = render_output_block(cell, &self.theme);
-            let output_text = if output_selected {
-                apply_mouse_selection_to_text(
-                    output_text,
-                    self.mouse_text_selection_for(index, CopyTarget::CellOutput),
-                    self.theme.style("cell.prompt.selected"),
-                )
-            } else {
-                output_text
-            };
-            let output = Paragraph::new(output_text)
-                .style(if output_selected {
-                    self.theme.style("cell.shell.selected")
+            let mut y = inner.y + 1 + input_area.height;
+            let mut remaining = available_output_height;
+            for (output_index, output) in cell.outputs.iter().enumerate() {
+                if remaining == 0 {
+                    break;
+                }
+                let block_height = self.output_block_height(cell, output_index, output);
+                let output_area = Rect {
+                    x: inner.x + 2,
+                    y,
+                    width: inner.width.saturating_sub(2),
+                    height: block_height.min(remaining),
+                };
+                if output_area.height == 0 || output_area.y >= viewport.y + viewport.height {
+                    break;
+                }
+                if let Some(table) = parse_display_table(output) {
+                    self.render_table_output(frame, output_area, index, output_index, &table);
                 } else {
-                    self.theme.style("output.block")
-                })
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
+                    let output_selected = selected
+                        && self.copy_target == CopyTarget::CellOutput
+                        && self.active_output_index.is_none();
+                    let output_text = Text::from(output_lines(output, &self.theme));
+                    let output_text = if output_selected {
+                        apply_mouse_selection_to_text(
+                            output_text,
+                            self.mouse_text_selection_for(index, CopyTarget::CellOutput),
+                            self.theme.style("cell.prompt.selected"),
+                        )
+                    } else {
+                        output_text
+                    };
+                    let output_widget = Paragraph::new(output_text)
                         .style(if output_selected {
                             self.theme.style("cell.shell.selected")
                         } else {
                             self.theme.style("output.block")
                         })
-                        .border_style(if output_selected {
-                            self.theme.style("cell.border.selected")
-                        } else {
-                            self.theme.style("output.border")
-                        })
-                        .title("Output"),
-                );
-            if output_area.height > 0 && output_area.y < viewport.y + viewport.height {
-                frame.render_widget(output, output_area);
-                self.hit_regions.push(HitRegion {
-                    rect: output_area,
-                    target: HitTarget::CellOutput(index),
-                });
-                let content_area = shrink(output_area, 1);
-                if content_area.width > 0 && content_area.height > 0 {
-                    self.content_regions.push(ContentRegion {
-                        rect: content_area,
-                        cell_index: index,
-                        target: CopyTarget::CellOutput,
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .style(if output_selected {
+                                    self.theme.style("cell.shell.selected")
+                                } else {
+                                    self.theme.style("output.block")
+                                })
+                                .border_style(if output_selected {
+                                    self.theme.style("cell.border.selected")
+                                } else {
+                                    self.theme.style("output.border")
+                                })
+                                .title("Output"),
+                        );
+                    frame.render_widget(output_widget, output_area);
+                    self.hit_regions.push(HitRegion {
+                        rect: output_area,
+                        target: HitTarget::CellOutput(index),
                     });
+                    let content_area = shrink(output_area, 1);
+                    if content_area.width > 0 && content_area.height > 0 {
+                        self.content_regions.push(ContentRegion {
+                            rect: content_area,
+                            cell_index: index,
+                            target: CopyTarget::CellOutput,
+                        });
+                    }
                 }
+                let gap =
+                    u16::from(output_index + 1 < cell.outputs.len() && remaining > block_height);
+                y = y.saturating_add(output_area.height).saturating_add(gap);
+                remaining = remaining.saturating_sub(output_area.height.saturating_add(gap));
             }
         }
+    }
+
+    fn render_table_output(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        cell_index: usize,
+        output_index: usize,
+        table: &ParsedTableOutput,
+    ) {
+        let Some(cell) = self.notebook.cells.get(cell_index) else {
+            return;
+        };
+        let state = self.output_state(&cell.id, output_index);
+        let selected = self.selected == Some(cell_index)
+            && self.copy_target == CopyTarget::CellOutput
+            && self.active_output_index == Some(output_index);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .style(if selected {
+                self.theme.style("cell.shell.selected")
+            } else {
+                self.theme.style("output.block")
+            })
+            .border_style(if selected {
+                self.theme.style("cell.border.selected")
+            } else {
+                self.theme.style("output.border")
+            })
+            .title("Output");
+        frame.render_widget(block, area);
+        self.hit_regions.push(HitRegion {
+            rect: area,
+            target: HitTarget::OutputTableFocus(cell_index, output_index),
+        });
+        let inner = shrink(area, 1);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let controls = Line::from(vec![
+            Span::styled(
+                if state.table_expanded {
+                    "[Collapse]"
+                } else {
+                    "[Expand]"
+                },
+                self.button_style(
+                    "cell.button.output",
+                    &HitTarget::OutputTableToggleExpand(cell_index, output_index),
+                ),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "[Copy]",
+                self.button_style(
+                    "cell.button.edit",
+                    &HitTarget::OutputTableCopyMenu(cell_index, output_index),
+                ),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "[<]",
+                self.button_style(
+                    "cell.button.add",
+                    &HitTarget::OutputTableScrollLeft(cell_index, output_index),
+                ),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "[>]",
+                self.button_style(
+                    "cell.button.add",
+                    &HitTarget::OutputTableScrollRight(cell_index, output_index),
+                ),
+            ),
+        ]);
+        let controls_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(controls), controls_area);
+        self.register_table_control_hits(
+            controls_area,
+            cell_index,
+            output_index,
+            state.copy_menu_open,
+        );
+
+        let mut y = inner.y + 1;
+        if state.copy_menu_open && y < inner.y + inner.height {
+            let copy_area = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let menu = Line::from(vec![
+                Span::raw("Copy as "),
+                Span::styled(
+                    "[TSV]",
+                    self.button_style(
+                        "cell.button.edit",
+                        &HitTarget::OutputTableCopyTsv(cell_index, output_index),
+                    ),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    "[CSV]",
+                    self.button_style(
+                        "cell.button.edit",
+                        &HitTarget::OutputTableCopyCsv(cell_index, output_index),
+                    ),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(menu), copy_area);
+            self.register_table_copy_menu_hits(copy_area, cell_index, output_index);
+            y = y.saturating_add(1);
+        }
+
+        if y >= inner.y + inner.height {
+            return;
+        }
+        let preview_rows = if state.table_expanded {
+            table.rows.len()
+        } else {
+            table.rows.len().min(4)
+        };
+        let table_lines =
+            render_table_grid_lines(table, preview_rows, state.table_scroll_x, inner.width);
+        let table_area = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: inner.y.saturating_add(inner.height).saturating_sub(y),
+        };
+        let clipped = table_lines
+            .into_iter()
+            .take(table_area.height as usize)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Text::from(clipped)), table_area);
+        self.content_regions.push(ContentRegion {
+            rect: table_area,
+            cell_index,
+            target: CopyTarget::CellOutput,
+        });
+    }
+
+    fn register_table_control_hits(
+        &mut self,
+        area: Rect,
+        cell_index: usize,
+        output_index: usize,
+        menu_open: bool,
+    ) {
+        let mut x = area.x;
+        for (label, target) in [
+            (
+                "[Collapse]",
+                HitTarget::OutputTableToggleExpand(cell_index, output_index),
+            ),
+            (
+                "[Copy]",
+                HitTarget::OutputTableCopyMenu(cell_index, output_index),
+            ),
+            (
+                "[<]",
+                HitTarget::OutputTableScrollLeft(cell_index, output_index),
+            ),
+            (
+                "[>]",
+                HitTarget::OutputTableScrollRight(cell_index, output_index),
+            ),
+        ] {
+            let label_width = label.chars().count() as u16;
+            self.hit_regions.push(HitRegion {
+                rect: Rect {
+                    x,
+                    y: area.y,
+                    width: label_width,
+                    height: 1,
+                },
+                target: if label == "[Collapse]" {
+                    HitTarget::OutputTableToggleExpand(cell_index, output_index)
+                } else {
+                    target
+                },
+            });
+            x = x.saturating_add(label_width + 1);
+        }
+        if menu_open {
+            self.hit_regions.push(HitRegion {
+                rect: area,
+                target: HitTarget::OutputTableFocus(cell_index, output_index),
+            });
+        }
+    }
+
+    fn register_table_copy_menu_hits(
+        &mut self,
+        area: Rect,
+        cell_index: usize,
+        output_index: usize,
+    ) {
+        let tsv_x = area.x + "Copy as ".chars().count() as u16;
+        self.hit_regions.push(HitRegion {
+            rect: Rect {
+                x: tsv_x,
+                y: area.y,
+                width: "[TSV]".chars().count() as u16,
+                height: 1,
+            },
+            target: HitTarget::OutputTableCopyTsv(cell_index, output_index),
+        });
+        let csv_x = tsv_x + "[TSV]".chars().count() as u16 + 1;
+        self.hit_regions.push(HitRegion {
+            rect: Rect {
+                x: csv_x,
+                y: area.y,
+                width: "[CSV]".chars().count() as u16,
+                height: 1,
+            },
+            target: HitTarget::OutputTableCopyCsv(cell_index, output_index),
+        });
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1884,6 +2139,7 @@ impl App {
         }) as isize;
         let next = (base + delta).clamp(0, max_index) as usize;
         self.selected = Some(next);
+        self.active_output_index = None;
         self.copy_target = CopyTarget::CellBody;
         self.clear_mouse_text_selection();
         self.load_selected_into_editor();
@@ -1892,6 +2148,7 @@ impl App {
 
     fn clear_selection(&mut self) {
         self.selected = None;
+        self.active_output_index = None;
         self.copy_target = CopyTarget::CellBody;
         self.command_prefix = None;
         self.clear_mouse_text_selection();
@@ -1943,6 +2200,7 @@ impl App {
             CellUiState::default(),
         );
         self.selected = Some(next);
+        self.active_output_index = None;
         self.copy_target = CopyTarget::CellBody;
         self.enter_edit_mode();
         self.status = "inserted code cell".to_string();
@@ -1971,6 +2229,7 @@ impl App {
             },
         );
         self.selected = Some(next);
+        self.active_output_index = None;
         self.copy_target = CopyTarget::CellBody;
         self.enter_edit_mode();
         self.status = "inserted markdown cell".to_string();
@@ -1996,6 +2255,7 @@ impl App {
         } else {
             self.selected = None;
         }
+        self.active_output_index = None;
         self.ensure_notebook_not_empty();
         self.copy_target = CopyTarget::CellBody;
         self.clear_mouse_text_selection();
@@ -2336,12 +2596,14 @@ impl App {
             HitTarget::ToolbarAddMarkdown => self.insert_markdown_cell(),
             HitTarget::CellSelect(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 self.load_selected_into_editor();
                 self.ensure_selected_visible();
             }
             HitTarget::CellEditor(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 self.enter_edit_mode();
                 if let Some(rect) = self.active_editor_rect {
@@ -2351,26 +2613,31 @@ impl App {
             HitTarget::CellOutput(index) => {
                 self.selected = Some(index);
                 self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = None;
                 self.load_selected_into_editor();
                 self.ensure_selected_visible();
             }
             HitTarget::CellRun(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 self.run_selected_cell()?;
             }
             HitTarget::CellEdit(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 self.enter_edit_mode();
             }
             HitTarget::CellToggleBody(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 self.toggle_body_for_selected();
             }
             HitTarget::CellToggleRender(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 if let Some(cell) = self.notebook.cells.get(index) {
                     let mode = self.cell_modes.entry(cell.id.0.clone()).or_default();
@@ -2385,7 +2652,83 @@ impl App {
             HitTarget::CellOpenImage(index) => {
                 self.selected = Some(index);
                 self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = None;
                 self.open_selected_visual()?;
+            }
+            HitTarget::OutputTableFocus(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                self.load_selected_into_editor();
+                self.ensure_selected_visible();
+            }
+            HitTarget::OutputTableToggleExpand(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let cell_id = cell.id.clone();
+                    let state = self.output_state_mut(&cell_id, output_index);
+                    state.table_expanded = !state.table_expanded;
+                }
+            }
+            HitTarget::OutputTableScrollLeft(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let cell_id = cell.id.clone();
+                    let state = self.output_state_mut(&cell_id, output_index);
+                    state.table_scroll_x = state.table_scroll_x.saturating_sub(8);
+                }
+            }
+            HitTarget::OutputTableScrollRight(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let cell_id = cell.id.clone();
+                    let state = self.output_state_mut(&cell_id, output_index);
+                    state.table_scroll_x = state.table_scroll_x.saturating_add(8);
+                }
+            }
+            HitTarget::OutputTableCopyMenu(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let cell_id = cell.id.clone();
+                    let state = self.output_state_mut(&cell_id, output_index);
+                    state.copy_menu_open = !state.copy_menu_open;
+                }
+            }
+            HitTarget::OutputTableCopyCsv(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let cell_id = cell.id.clone();
+                    if let Some(table) =
+                        cell.outputs.get(output_index).and_then(parse_display_table)
+                    {
+                        self.copy_text("table csv", &table.to_delimited(','))?;
+                        self.output_state_mut(&cell_id, output_index).copy_menu_open = false;
+                    }
+                }
+            }
+            HitTarget::OutputTableCopyTsv(index, output_index) => {
+                self.selected = Some(index);
+                self.copy_target = CopyTarget::CellOutput;
+                self.active_output_index = Some(output_index);
+                if let Some(cell) = self.notebook.cells.get(index) {
+                    let cell_id = cell.id.clone();
+                    if let Some(table) =
+                        cell.outputs.get(output_index).and_then(parse_display_table)
+                    {
+                        self.copy_text("table tsv", &table.to_delimited('\t'))?;
+                        self.output_state_mut(&cell_id, output_index).copy_menu_open = false;
+                    }
+                }
             }
             HitTarget::MarkdownImageOpen(index, block_index, link_index) => {
                 self.selected = Some(index);
@@ -2394,6 +2737,7 @@ impl App {
             }
             HitTarget::CellInsertBelow(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 if matches!(self.notebook.cells[index].kind, CellKind::Markdown) {
                     self.insert_markdown_cell();
@@ -2403,6 +2747,7 @@ impl App {
             }
             HitTarget::CellDelete(index) => {
                 self.selected = Some(index);
+                self.active_output_index = None;
                 self.copy_target = CopyTarget::CellBody;
                 self.delete_selected_cell();
             }
@@ -2911,7 +3256,27 @@ impl App {
     }
 
     fn output_height(&self, cell: &Cell) -> u16 {
-        let lines = render_output_block(cell, &self.theme).lines.len().max(1);
+        cell.outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| self.output_block_height(cell, index, output))
+            .sum::<u16>()
+            .saturating_add(cell.outputs.len().saturating_sub(1) as u16)
+    }
+
+    fn output_block_height(&self, cell: &Cell, output_index: usize, output: &CellOutput) -> u16 {
+        if let Some(table) = parse_display_table(output) {
+            let state = self.output_state(&cell.id, output_index);
+            let preview_rows = if state.table_expanded {
+                table.rows.len()
+            } else {
+                table.rows.len().min(4)
+            };
+            let menu_rows = usize::from(state.copy_menu_open);
+            let grid_rows = 4 + preview_rows + usize::from(table.footer.is_some());
+            return (grid_rows + 1 + menu_rows + 2) as u16;
+        }
+        let lines = output_lines(output, &self.theme).len().max(1);
         (lines as u16).min(8) + 2
     }
 
@@ -3310,6 +3675,11 @@ impl App {
     }
 
     fn copy_selected_output(&mut self) -> Result<()> {
+        if let Some((cell_index, _output_index, table)) = self.active_table_output() {
+            if Some(cell_index) == self.selected {
+                return self.copy_text("table output", &table.to_delimited('\t'));
+            }
+        }
         if let Some(text) = self.selected_mouse_text(CopyTarget::CellOutput) {
             return self.copy_text("selection", &text);
         }
@@ -3360,6 +3730,30 @@ impl App {
 
     fn set_copy_status(&mut self, label: &str, result: ClipboardResult) {
         self.status = format!("copied {label} via {}", result.backend.label());
+    }
+
+    fn output_state_key(cell_id: &CellId, output_index: usize) -> String {
+        format!("{}:{output_index}", cell_id.0)
+    }
+
+    fn output_state_mut(&mut self, cell_id: &CellId, output_index: usize) -> &mut OutputUiState {
+        let key = Self::output_state_key(cell_id, output_index);
+        self.output_states.entry(key).or_default()
+    }
+
+    fn output_state(&self, cell_id: &CellId, output_index: usize) -> OutputUiState {
+        self.output_states
+            .get(&Self::output_state_key(cell_id, output_index))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn active_table_output(&self) -> Option<(usize, usize, ParsedTableOutput)> {
+        let cell_index = self.selected?;
+        let output_index = self.active_output_index?;
+        let cell = self.notebook.cells.get(cell_index)?;
+        let output = cell.outputs.get(output_index)?;
+        parse_display_table(output).map(|table| (cell_index, output_index, table))
     }
 
     fn selected_mouse_text(&self, target: CopyTarget) -> Option<String> {
@@ -3765,77 +4159,168 @@ fn render_code_block(cell: &Cell, theme: &Theme) -> Text<'static> {
     SyntaxHighlighter::highlight_with_theme(cell.language, &cell.source, theme)
 }
 
-fn render_output_block(cell: &Cell, theme: &Theme) -> Text<'static> {
-    let mut lines = Vec::new();
-    for output in &cell.outputs {
-        if let Some(image) = output.image_info() {
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "Image [{}] {}",
-                    image.mime,
-                    image.alt.unwrap_or_else(|| "open with [Open]".to_string())
-                ),
-                theme.style("output.stream.label"),
-            )]));
-            if let Some(path) = image.path {
-                lines.push(Line::from(path));
-            }
-            continue;
+fn output_lines(output: &CellOutput, theme: &Theme) -> Vec<Line<'static>> {
+    if let Some(image) = output.image_info() {
+        let mut lines = vec![Line::from(vec![Span::styled(
+            format!(
+                "Image [{}] {}",
+                image.mime,
+                image.alt.unwrap_or_else(|| "open with [Open]".to_string())
+            ),
+            theme.style("output.stream.label"),
+        )])];
+        if let Some(path) = image.path {
+            lines.push(Line::from(path));
         }
-        match output {
-            CellOutput::Stream { name, text } => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{name}:"),
-                    theme.style("output.stream.label"),
-                )]));
-                for line in text.lines() {
+        return lines;
+    }
+    match output {
+        CellOutput::Stream { name, text } => {
+            let mut lines = vec![Line::from(vec![Span::styled(
+                format!("{name}:"),
+                theme.style("output.stream.label"),
+            )])];
+            for line in text.lines() {
+                lines.push(Line::from(line.to_string()));
+            }
+            lines
+        }
+        CellOutput::ExecuteResult {
+            execution_count,
+            data,
+            ..
+        } => {
+            let mut lines = vec![Line::from(vec![Span::styled(
+                format!("Out [{execution_count}]:"),
+                theme.style("output.result.label"),
+            )])];
+            if let Some(value) = data.get("text/plain") {
+                for line in value.as_str().unwrap_or_default().lines() {
                     lines.push(Line::from(line.to_string()));
                 }
             }
-            CellOutput::ExecuteResult {
-                execution_count,
-                data,
-                ..
-            } => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("Out [{execution_count}]:"),
-                    theme.style("output.result.label"),
-                )]));
-                if let Some(value) = data.get("text/plain") {
-                    for line in value.as_str().unwrap_or_default().lines() {
-                        lines.push(Line::from(line.to_string()));
-                    }
-                }
-            }
-            CellOutput::DisplayData { data, .. } => {
-                if let Some(value) = data.get("text/plain") {
-                    for line in value.as_str().unwrap_or_default().lines() {
-                        lines.push(Line::from(line.to_string()));
-                    }
-                }
-            }
-            CellOutput::Error {
-                ename,
-                evalue,
-                traceback,
-            } => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{ename}: {evalue}"),
-                    theme.style("output.error.label"),
-                )]));
-                for line in traceback {
-                    lines.push(Line::from(Span::styled(
-                        line.clone(),
-                        theme.style("output.error.trace"),
-                    )));
-                }
-            }
+            lines
         }
+        CellOutput::DisplayData { data, .. } => {
+            let mut lines = Vec::new();
+            if let Some(value) = data.get("text/plain") {
+                for line in value.as_str().unwrap_or_default().lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
+            lines
+        }
+        CellOutput::Error {
+            ename,
+            evalue,
+            traceback,
+        } => {
+            let mut lines = vec![Line::from(vec![Span::styled(
+                format!("{ename}: {evalue}"),
+                theme.style("output.error.label"),
+            )])];
+            for line in traceback {
+                lines.push(Line::from(Span::styled(
+                    line.clone(),
+                    theme.style("output.error.trace"),
+                )));
+            }
+            lines
+        }
+    }
+}
+
+fn render_output_block(cell: &Cell, theme: &Theme) -> Text<'static> {
+    let mut lines = Vec::new();
+    for output in &cell.outputs {
+        lines.extend(output_lines(output, theme));
     }
     if lines.is_empty() {
         lines.push(Line::from("No output."));
     }
     Text::from(lines)
+}
+
+fn slice_chars(input: &str, start: usize, width: usize) -> String {
+    input.chars().skip(start).take(width).collect()
+}
+
+fn table_column_widths(table: &ParsedTableOutput) -> Vec<usize> {
+    let mut widths = table
+        .headers
+        .iter()
+        .map(|value| value.chars().count())
+        .collect::<Vec<_>>();
+    for row in &table.rows {
+        for (index, value) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(value.chars().count());
+            }
+        }
+    }
+    widths
+}
+
+fn render_table_grid_lines(
+    table: &ParsedTableOutput,
+    preview_rows: usize,
+    scroll_x: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let widths = table_column_widths(table);
+    let top = format!(
+        "┌{}┐",
+        widths
+            .iter()
+            .map(|w| "─".repeat(*w + 2))
+            .collect::<Vec<_>>()
+            .join("┬")
+    );
+    let header = format!(
+        "│ {} │",
+        table
+            .headers
+            .iter()
+            .zip(&widths)
+            .map(|(value, width)| format!("{value:<width$}"))
+            .collect::<Vec<_>>()
+            .join(" │ ")
+    );
+    let separator = format!(
+        "├{}┤",
+        widths
+            .iter()
+            .map(|w| "─".repeat(*w + 2))
+            .collect::<Vec<_>>()
+            .join("┼")
+    );
+    let mut lines = vec![top, header, separator];
+    for row in table.rows.iter().take(preview_rows) {
+        lines.push(format!(
+            "│ {} │",
+            row.iter()
+                .zip(&widths)
+                .map(|(value, width)| format!("{value:<width$}"))
+                .collect::<Vec<_>>()
+                .join(" │ ")
+        ));
+    }
+    let bottom = format!(
+        "└{}┘",
+        widths
+            .iter()
+            .map(|w| "─".repeat(*w + 2))
+            .collect::<Vec<_>>()
+            .join("┴")
+    );
+    lines.push(bottom);
+    if let Some(footer) = &table.footer {
+        lines.push(footer.clone());
+    }
+    lines
+        .into_iter()
+        .map(|line| Line::from(slice_chars(&line, scroll_x, width as usize)))
+        .collect()
 }
 
 fn output_text(cell: &Cell, notebook_path: Option<&std::path::Path>) -> String {
@@ -3926,6 +4411,7 @@ fn parse_table_text(text: &str) -> Option<ParsedTableOutput> {
     let rows = lines
         .iter()
         .skip(1)
+        .filter(|line| !line.trim().is_empty())
         .map(|line| split_table_line(line))
         .collect::<Vec<_>>();
     if rows.is_empty() {
@@ -3962,7 +4448,9 @@ fn split_table_line(line: &str) -> Vec<String> {
             while index + run < chars.len() && chars[index + run] == ' ' {
                 run += 1;
             }
-            if run >= 2 {
+            let single_space_index_split =
+                run == 1 && cells.is_empty() && current.chars().all(|c| c.is_ascii_digit());
+            if run >= 2 || single_space_index_split {
                 if !current.trim().is_empty() || !cells.is_empty() {
                     cells.push(current.trim().to_string());
                     current.clear();
@@ -4151,6 +4639,7 @@ mod tests {
     use crate::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use serde_json::Value;
     use tempfile::TempDir;
 
     #[test]
@@ -4907,6 +5396,98 @@ mod tests {
                 .filter_map(|row| row.find("Output"))
                 .any(|offset| offset > 0)
         );
+    }
+
+    #[test]
+    fn display_tables_render_with_controls_and_borders() {
+        let mut cell = Cell::code(Language::Python, "display(df)");
+        cell.outputs = vec![CellOutput::DisplayData {
+            data: BTreeMap::from([(
+                "text/plain".to_string(),
+                Value::String(
+                    "      method  score\n0 region_mean   0.75\n1      random   0.62\n\n[2 rows x 2 columns]"
+                        .to_string(),
+                ),
+            )]),
+            metadata: BTreeMap::new(),
+        }];
+        let notebook = Notebook::new("Table").with_cells(vec![cell]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[Expand]"));
+        assert!(rendered.contains("[Copy]"));
+        assert!(rendered.contains("┌"));
+        assert!(rendered.contains("method"));
+    }
+
+    #[test]
+    fn table_copy_csv_and_tsv_use_clipboard() {
+        let mut cell = Cell::code(Language::Python, "display(df)");
+        cell.outputs = vec![CellOutput::DisplayData {
+            data: BTreeMap::from([(
+                "text/plain".to_string(),
+                Value::String("      method  score\n0 region_mean   0.75".to_string()),
+            )]),
+            metadata: BTreeMap::new(),
+        }];
+        let notebook = Notebook::new("TableCopy").with_cells(vec![cell]);
+        let session = SessionManager::new(&notebook);
+        let (clipboard, store) = Clipboard::memory();
+        let mut app = App::new_with_clipboard(
+            notebook,
+            None,
+            session,
+            false,
+            Theme::default_theme(),
+            None,
+            clipboard,
+        );
+
+        app.activate_hit_target(HitTarget::OutputTableCopyCsv(0, 0), 0, 0)
+            .unwrap();
+        app.activate_hit_target(HitTarget::OutputTableCopyTsv(0, 0), 0, 0)
+            .unwrap();
+
+        let copied = store.lock().unwrap().clone();
+        assert_eq!(copied[0], ",method,score\n0,region_mean,0.75");
+        assert_eq!(copied[1], "\tmethod\tscore\n0\tregion_mean\t0.75");
+    }
+
+    #[test]
+    fn table_scroll_buttons_update_horizontal_offset() {
+        let mut cell = Cell::code(Language::Python, "display(df)");
+        cell.outputs = vec![CellOutput::DisplayData {
+            data: BTreeMap::from([(
+                "text/plain".to_string(),
+                Value::String(
+                    "      method  very_wide_column_name\n0 region_mean  0.75".to_string(),
+                ),
+            )]),
+            metadata: BTreeMap::new(),
+        }];
+        let notebook = Notebook::new("TableScroll").with_cells(vec![cell]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+
+        app.activate_hit_target(HitTarget::OutputTableScrollRight(0, 0), 0, 0)
+            .unwrap();
+        app.activate_hit_target(HitTarget::OutputTableScrollLeft(0, 0), 0, 0)
+            .unwrap();
+
+        let state = app.output_state(&app.notebook.cells[0].id, 0);
+        assert_eq!(state.table_scroll_x, 0);
     }
 
     #[test]
