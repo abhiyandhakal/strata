@@ -1241,8 +1241,8 @@ impl App {
                 height,
             };
             let top_skip = visible_top.saturating_sub(cell_top);
-            if visible_bottom < cell_bottom {
-                self.draw_clipped_cell(frame, cell_area, index, &cell, top_skip);
+            if top_skip == 0 && visible_bottom < cell_bottom {
+                self.draw_bottom_clipped_cell(frame, cell_area, index, &cell);
             } else if top_skip == 0 {
                 self.draw_cell(frame, area, cell_area, index, &cell);
             } else {
@@ -1250,6 +1250,230 @@ impl App {
             }
             cell_top = cell_bottom;
         }
+    }
+
+    fn build_cell_chrome(&self, index: usize, cell: &Cell, rendered: bool) -> Line<'static> {
+        let chrome_style = if self.selected == Some(index) {
+            self.theme.style("cell.prompt.selected")
+        } else {
+            self.theme.style("cell.prompt")
+        };
+        let mut chrome_spans = vec![
+            Span::styled(self.cell_prompt(index, cell), chrome_style),
+            Span::raw(" "),
+        ];
+        if self.is_cell_runnable(cell) {
+            chrome_spans.push(Span::styled(
+                "[Run]",
+                self.button_style("cell.button.run", &HitTarget::CellRun(index)),
+            ));
+            chrome_spans.push(Span::raw(" "));
+        } else if matches!(cell.kind, CellKind::Code) {
+            chrome_spans.push(Span::styled(
+                "[Unsupported]",
+                self.theme.style("output.error.label"),
+            ));
+            chrome_spans.push(Span::raw(" "));
+        }
+        chrome_spans.push(Span::styled(
+            match cell.kind {
+                CellKind::Markdown => {
+                    if rendered {
+                        "[Edit]"
+                    } else {
+                        "[Render]"
+                    }
+                }
+                _ => "[Edit]",
+            },
+            if cell.kind == CellKind::Markdown {
+                self.button_style("cell.button.edit", &HitTarget::CellToggleRender(index))
+            } else {
+                self.button_style("cell.button.edit", &HitTarget::CellEdit(index))
+            },
+        ));
+        chrome_spans.push(Span::raw(" "));
+        chrome_spans.push(Span::styled(
+            "[+]",
+            self.button_style("cell.button.add", &HitTarget::CellInsertBelow(index)),
+        ));
+        chrome_spans.push(Span::raw(" "));
+        chrome_spans.push(Span::styled(
+            if self.cell_mode(cell).body_collapsed {
+                "[Unfold]"
+            } else {
+                "[Fold]"
+            },
+            self.button_style("cell.button.edit", &HitTarget::CellToggleBody(index)),
+        ));
+        chrome_spans.push(Span::raw(" "));
+        chrome_spans.push(Span::styled(
+            "[Del]",
+            self.button_style("cell.button.delete", &HitTarget::CellDelete(index)),
+        ));
+        if !cell.outputs.is_empty() {
+            chrome_spans.push(Span::raw(" "));
+            chrome_spans.push(Span::styled(
+                if self.cell_mode(cell).output_collapsed {
+                    "[Show Out]"
+                } else {
+                    "[Hide Out]"
+                },
+                self.button_style("cell.button.output", &HitTarget::CellToggleOutput(index)),
+            ));
+            if self.first_image_output(cell).is_some() {
+                chrome_spans.push(Span::raw(" "));
+                chrome_spans.push(Span::styled(
+                    "[Open]",
+                    self.button_style(
+                        "toolbar.button.add_markdown",
+                        &HitTarget::CellOpenImage(index),
+                    ),
+                ));
+            }
+        }
+        Line::from(chrome_spans)
+    }
+
+    fn cell_title(&self, cell: &Cell, rendered: bool) -> String {
+        match cell.kind {
+            CellKind::Code => format!("code {}", cell.language.fence_name()),
+            CellKind::Markdown => {
+                if rendered {
+                    "markdown rendered".to_string()
+                } else {
+                    "markdown".to_string()
+                }
+            }
+            CellKind::Raw => "raw".to_string(),
+            CellKind::Ai => "ai".to_string(),
+        }
+    }
+
+    fn body_text(&self, cell: &Cell, rendered: bool) -> Text<'static> {
+        match cell.kind {
+            CellKind::Markdown if rendered => Text::from(
+                render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme)
+                    .blocks
+                    .into_iter()
+                    .flat_map(|block| match block {
+                        MarkdownBlock::Text { line, .. } => vec![line],
+                        MarkdownBlock::Image { alt, .. } => {
+                            vec![Line::from(vec![Span::styled(
+                                alt,
+                                self.theme.style("markdown.image.link"),
+                            )])]
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            CellKind::Code => render_code_block(cell, &self.theme),
+            _ => Text::from(cell.source.clone()),
+        }
+    }
+
+    fn draw_bottom_clipped_cell(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        index: usize,
+        cell: &Cell,
+    ) {
+        let selected = self.selected == Some(index);
+        let shell_style = if selected {
+            self.theme.style("cell.shell.selected")
+        } else {
+            self.theme.style("cell.shell")
+        };
+        let border_style = if selected {
+            self.theme.style("cell.border.selected")
+        } else {
+            self.theme.style("cell.border")
+        };
+        let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
+        let chrome = self.build_cell_chrome(index, cell, rendered);
+        let title = self.cell_title(cell, rendered);
+        let body_collapsed = self.cell_mode(cell).body_collapsed;
+
+        self.hit_regions.push(HitRegion {
+            rect: area,
+            target: HitTarget::CellSelect(index),
+        });
+
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        if area.height == 1 || area.width < 10 {
+            frame.render_widget(Paragraph::new(chrome).style(shell_style), area);
+            return;
+        }
+
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .border_style(border_style)
+                .style(shell_style),
+            area,
+        );
+        let inner = shrink(area, 1);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let chrome_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(chrome), chrome_area);
+        self.register_cell_chrome_hits(chrome_area, index, cell, rendered);
+
+        let remaining_height = inner.height.saturating_sub(1);
+        if remaining_height == 0 {
+            return;
+        }
+
+        let mut lines = vec![Line::from(title)];
+        if body_collapsed {
+            lines.push(Line::from(vec![Span::styled(
+                "... cell body collapsed ...",
+                self.theme.style("output.stream.label"),
+            )]));
+        } else {
+            lines.extend(self.body_text(cell, rendered).lines);
+        }
+        if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
+            lines.push(Line::from("Output"));
+            lines.extend(render_output_block(cell, &self.theme).lines);
+        }
+
+        let content_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: remaining_height,
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                lines
+                    .into_iter()
+                    .take(remaining_height as usize)
+                    .collect::<Vec<_>>(),
+            ))
+            .style(shell_style)
+            .wrap(Wrap { trim: false }),
+            content_area,
+        );
+        self.hit_regions.push(HitRegion {
+            rect: content_area,
+            target: HitTarget::CellEditor(index),
+        });
+        self.content_regions.push(ContentRegion {
+            rect: content_area,
+            cell_index: index,
+            target: CopyTarget::CellBody,
+        });
     }
 
     fn draw_clipped_cell(
@@ -1271,32 +1495,8 @@ impl App {
         } else {
             self.theme.style("cell.border")
         };
-        let prompt = match cell.kind {
-            CellKind::Code => self.cell_prompt(index, cell),
-            CellKind::Markdown => "[Markdown]".to_string(),
-            CellKind::Raw => "[Raw]".to_string(),
-            CellKind::Ai => "[AI]".to_string(),
-        };
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
-        let body_text = match cell.kind {
-            CellKind::Markdown if rendered => Text::from(
-                render_markdown_blocks(&cell.source, self.notebook_path.as_deref(), &self.theme)
-                    .blocks
-                    .into_iter()
-                    .flat_map(|block| match block {
-                        MarkdownBlock::Text { line, .. } => vec![line],
-                        MarkdownBlock::Image { alt, .. } => {
-                            vec![Line::from(vec![Span::styled(
-                                alt,
-                                self.theme.style("markdown.image.link"),
-                            )])]
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            CellKind::Code => render_code_block(cell, &self.theme),
-            _ => Text::from(cell.source.clone()),
-        };
+        let body_text = self.body_text(cell, rendered);
         let title = if top_skip > 0 {
             match cell.kind {
                 CellKind::Code => format!("code {} (continued)", cell.language.fence_name()),
@@ -1325,7 +1525,7 @@ impl App {
             }
         };
         let mut lines = Vec::new();
-        lines.push(Line::from(prompt));
+        lines.push(Line::from(self.cell_prompt(index, cell)));
         lines.extend(body_text.lines);
         if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
             lines.push(Line::from("Output"));
@@ -1400,87 +1600,9 @@ impl App {
                 .style(shell_style),
             area,
         );
-        let chrome_style = if selected {
-            self.theme.style("cell.prompt.selected")
-        } else {
-            self.theme.style("cell.prompt")
-        };
-        let prompt = match cell.kind {
-            CellKind::Code => self.cell_prompt(index, cell),
-            CellKind::Markdown => "[Markdown]".to_string(),
-            CellKind::Raw => "[Raw]".to_string(),
-            CellKind::Ai => "[AI]".to_string(),
-        };
         let rendered = self.cell_mode(cell).rendered && cell.kind == CellKind::Markdown;
         let body_collapsed = self.cell_mode(cell).body_collapsed;
-        let mut chrome_spans = vec![Span::styled(prompt, chrome_style), Span::raw(" ")];
-        if self.is_cell_runnable(cell) {
-            chrome_spans.push(Span::styled(
-                "[Run]",
-                self.button_style("cell.button.run", &HitTarget::CellRun(index)),
-            ));
-            chrome_spans.push(Span::raw(" "));
-        } else if matches!(cell.kind, CellKind::Code) {
-            chrome_spans.push(Span::styled(
-                "[Unsupported]",
-                self.theme.style("output.error.label"),
-            ));
-            chrome_spans.push(Span::raw(" "));
-        }
-        chrome_spans.push(Span::styled(
-            match cell.kind {
-                CellKind::Markdown => {
-                    if rendered {
-                        "[Edit]"
-                    } else {
-                        "[Render]"
-                    }
-                }
-                _ => "[Edit]",
-            },
-            if cell.kind == CellKind::Markdown {
-                self.button_style("cell.button.edit", &HitTarget::CellToggleRender(index))
-            } else {
-                self.button_style("cell.button.edit", &HitTarget::CellEdit(index))
-            },
-        ));
-        chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled(
-            "[+]",
-            self.button_style("cell.button.add", &HitTarget::CellInsertBelow(index)),
-        ));
-        chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled(
-            if body_collapsed { "[Unfold]" } else { "[Fold]" },
-            self.button_style("cell.button.edit", &HitTarget::CellToggleBody(index)),
-        ));
-        chrome_spans.push(Span::raw(" "));
-        chrome_spans.push(Span::styled(
-            "[Del]",
-            self.button_style("cell.button.delete", &HitTarget::CellDelete(index)),
-        ));
-        if !cell.outputs.is_empty() {
-            chrome_spans.push(Span::raw(" "));
-            chrome_spans.push(Span::styled(
-                if self.cell_mode(cell).output_collapsed {
-                    "[Show Out]"
-                } else {
-                    "[Hide Out]"
-                },
-                self.button_style("cell.button.output", &HitTarget::CellToggleOutput(index)),
-            ));
-            if self.first_image_output(cell).is_some() {
-                chrome_spans.push(Span::raw(" "));
-                chrome_spans.push(Span::styled(
-                    "[Open]",
-                    self.button_style(
-                        "toolbar.button.add_markdown",
-                        &HitTarget::CellOpenImage(index),
-                    ),
-                ));
-            }
-        }
-        let chrome = Line::from(chrome_spans);
+        let chrome = self.build_cell_chrome(index, cell, rendered);
         let chrome_area = Rect {
             x: inner.x,
             y: inner.y,
@@ -1503,18 +1625,7 @@ impl App {
             height: input_height,
         };
         let inner_input = shrink(input_area, 1);
-        let title = match cell.kind {
-            CellKind::Code => format!("code {}", cell.language.fence_name()),
-            CellKind::Markdown => {
-                if rendered {
-                    "markdown rendered".to_string()
-                } else {
-                    "markdown".to_string()
-                }
-            }
-            CellKind::Raw => "raw".to_string(),
-            CellKind::Ai => "ai".to_string(),
-        };
+        let title = self.cell_title(cell, rendered);
 
         if body_collapsed {
             let collapsed = Paragraph::new(Line::from(vec![Span::styled(
@@ -4466,6 +4577,34 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("continued"));
+    }
+
+    #[test]
+    fn bottom_clipped_cells_keep_standard_chrome() {
+        let source = (0..20)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook =
+            Notebook::new("BottomChrome").with_cells(vec![Cell::code(Language::Python, source)]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[Run]"));
+        assert!(rendered.contains("[Edit]"));
+        assert!(rendered.contains("code python"));
+        assert!(!rendered.contains("continued"));
     }
 
     #[test]
