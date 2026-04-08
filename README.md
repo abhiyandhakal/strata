@@ -2,6 +2,8 @@
 
 Strata is a terminal-first notebook for Python-heavy exploratory work.
 
+![Strata notebook UI](assets/demo.png)
+
 Today, the product is best understood as:
 
 - a notebook-style TUI for code and markdown cells
