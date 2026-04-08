@@ -1232,9 +1232,6 @@ impl App {
                 cell_top = cell_bottom;
                 continue;
             }
-            if visible_bottom < cell_bottom && height < 4 {
-                break;
-            }
             let cell_area = Rect {
                 x: area.x,
                 y: area
@@ -1244,7 +1241,9 @@ impl App {
                 height,
             };
             let top_skip = visible_top.saturating_sub(cell_top);
-            if top_skip == 0 {
+            if visible_bottom < cell_bottom {
+                self.draw_clipped_cell(frame, cell_area, index, &cell, top_skip);
+            } else if top_skip == 0 {
                 self.draw_cell(frame, area, cell_area, index, &cell);
             } else {
                 self.draw_clipped_cell(frame, cell_area, index, &cell, top_skip);
@@ -1298,17 +1297,32 @@ impl App {
             CellKind::Code => render_code_block(cell, &self.theme),
             _ => Text::from(cell.source.clone()),
         };
-        let title = match cell.kind {
-            CellKind::Code => format!("code {} (continued)", cell.language.fence_name()),
-            CellKind::Markdown => {
-                if rendered {
-                    "markdown rendered (continued)".to_string()
-                } else {
-                    "markdown (continued)".to_string()
+        let title = if top_skip > 0 {
+            match cell.kind {
+                CellKind::Code => format!("code {} (continued)", cell.language.fence_name()),
+                CellKind::Markdown => {
+                    if rendered {
+                        "markdown rendered (continued)".to_string()
+                    } else {
+                        "markdown (continued)".to_string()
+                    }
                 }
+                CellKind::Raw => "raw (continued)".to_string(),
+                CellKind::Ai => "ai (continued)".to_string(),
             }
-            CellKind::Raw => "raw (continued)".to_string(),
-            CellKind::Ai => "ai (continued)".to_string(),
+        } else {
+            match cell.kind {
+                CellKind::Code => format!("code {}", cell.language.fence_name()),
+                CellKind::Markdown => {
+                    if rendered {
+                        "markdown rendered".to_string()
+                    } else {
+                        "markdown".to_string()
+                    }
+                }
+                CellKind::Raw => "raw".to_string(),
+                CellKind::Ai => "ai".to_string(),
+            }
         };
         let mut lines = Vec::new();
         lines.push(Line::from(prompt));
@@ -1317,13 +1331,30 @@ impl App {
             lines.push(Line::from("Output"));
             lines.extend(render_output_block(cell, &self.theme).lines);
         }
+        let compact = area.height < 3 || area.width < 10;
+        let visible_line_count = if compact {
+            area.height as usize
+        } else {
+            area.height.saturating_sub(2) as usize
+        };
         let text = Text::from(
             lines
                 .into_iter()
                 .skip(top_skip as usize)
-                .take(area.height.saturating_sub(2) as usize)
+                .take(visible_line_count)
                 .collect::<Vec<_>>(),
         );
+        self.hit_regions.push(HitRegion {
+            rect: area,
+            target: HitTarget::CellSelect(index),
+        });
+        if compact {
+            frame.render_widget(
+                Paragraph::new(text).style(style).wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
         let block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(border)
@@ -4438,7 +4469,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_trailing_bottom_fragment_is_not_drawn_as_empty_box() {
+    fn tiny_trailing_bottom_fragment_renders_visible_content() {
         let source = (0..14)
             .map(|index| format!("line_{index}"))
             .collect::<Vec<_>>()
@@ -4455,14 +4486,19 @@ mod tests {
 
         terminal.draw(|frame| app.draw(frame)).unwrap();
 
-        let rendered = terminal
-            .backend()
-            .buffer()
+        let buffer = terminal.backend().buffer().clone();
+        let width = 90usize;
+        let rows = buffer
             .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!rendered.contains("code python"));
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .rev()
+                .take(4)
+                .any(|row| row.contains("In [") || row.contains("line_0") || row.contains("code"))
+        );
     }
 
     #[test]
