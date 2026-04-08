@@ -1244,7 +1244,14 @@ impl App {
             if top_skip == 0 {
                 self.draw_cell(frame, area, cell_area, index, &cell);
             } else {
-                self.draw_clipped_cell(frame, cell_area, index, &cell, top_skip);
+                self.draw_clipped_cell(
+                    frame,
+                    cell_area,
+                    index,
+                    &cell,
+                    top_skip,
+                    visible_bottom < cell_bottom,
+                );
             }
             cell_top = cell_bottom;
         }
@@ -1377,6 +1384,7 @@ impl App {
         index: usize,
         cell: &Cell,
         top_skip: u16,
+        bottom_clipped: bool,
     ) {
         let selected = self.selected == Some(index);
         let style = if selected {
@@ -1436,11 +1444,12 @@ impl App {
             lines.push(Line::from("Output"));
             lines.extend(render_output_block(cell, &self.theme).lines);
         }
-        let compact = area.height < 3 || area.width < 10;
+        let compact = area.width < 10 || area.height < if bottom_clipped { 3 } else { 5 };
         let visible_line_count = if compact {
             area.height as usize
         } else {
-            area.height.saturating_sub(3) as usize
+            area.height
+                .saturating_sub(if bottom_clipped { 3 } else { 4 }) as usize
         };
         let text = Text::from(
             lines
@@ -1460,8 +1469,13 @@ impl App {
             );
             return;
         }
+        let shell_borders = if bottom_clipped {
+            Borders::TOP | Borders::LEFT | Borders::RIGHT
+        } else {
+            Borders::ALL
+        };
         let outer = Block::default()
-            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .borders(shell_borders)
             .border_style(border)
             .style(style);
         frame.render_widget(outer, area);
@@ -1476,7 +1490,7 @@ impl App {
             height: shell_inner.height,
         };
         let inner_block = Block::default()
-            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .borders(shell_borders)
             .border_style(border)
             .style(style)
             .title(title);
@@ -4548,8 +4562,19 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
+        let rows = buffer
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
         assert_ne!(first_row.chars().next(), Some('c'));
         assert!(rendered.contains("continued"));
+        assert!(
+            rows.iter()
+                .rev()
+                .find(|row| !row.trim().is_empty())
+                .is_some_and(|row| row.contains("─") || row.contains("│"))
+        );
     }
 
     #[test]
