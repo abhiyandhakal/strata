@@ -38,6 +38,8 @@ STATE = {"__builtins__": __builtins__}
 def _coerce_mime_value(mime, value):
     if value is None:
         return None
+    if isinstance(value, (dict, list, int, float, bool)):
+        return value
     if isinstance(value, bytes):
         if mime in {"image/png", "image/jpeg", "application/pdf"}:
             import base64
@@ -49,11 +51,41 @@ def _coerce_mime_value(mime, value):
     return str(value)
 
 
+def _structured_table_payload(obj):
+    module = getattr(obj.__class__, "__module__", "")
+    name = getattr(obj.__class__, "__name__", "")
+    if not module.startswith("pandas"):
+        return None
+
+    if name == "DataFrame":
+        headers = [str(column) for column in obj.columns.tolist()]
+        rows = [[str(index)] + [str(value) for value in row] for index, row in zip(obj.index.tolist(), obj.values.tolist())]
+        footer = f"[{len(obj)} rows x {len(headers)} columns]"
+        return {
+            "headers": [""] + headers,
+            "rows": rows,
+            "footer": footer,
+        }
+
+    if name == "Series":
+        headers = ["", str(getattr(obj, "name", "") or "value")]
+        rows = [[str(index), str(value)] for index, value in obj.items()]
+        footer = f"[{len(obj)} rows x 1 columns]"
+        return {
+            "headers": headers,
+            "rows": rows,
+            "footer": footer,
+        }
+
+    return None
+
+
 def _display_payload(obj):
     if obj is None:
         return {"data": {"text/plain": "None"}, "metadata": {}}
 
     plain_fallback = repr(obj)
+    structured_table = _structured_table_payload(obj)
 
     bundle_method = getattr(obj, "_repr_mimebundle_", None)
     if callable(bundle_method):
@@ -70,6 +102,8 @@ def _display_payload(obj):
                 if coerced is not None:
                     normalized[str(mime)] = coerced
             if normalized:
+                if structured_table is not None:
+                    normalized["application/x-strata-table+json"] = structured_table
                 normalized.setdefault("text/plain", plain_fallback)
                 return {"data": normalized, "metadata": metadata or {}}
 
@@ -87,13 +121,18 @@ def _display_payload(obj):
             coerced = _coerce_mime_value(mime, value)
             if coerced:
                 payload = {mime: coerced}
+                if structured_table is not None:
+                    payload["application/x-strata-table+json"] = structured_table
                 payload.setdefault("text/plain", plain_fallback)
                 return {"data": payload, "metadata": {}}
 
     if isinstance(obj, (str, int, float, bool, Path)):
         return {"data": {"text/plain": str(obj)}, "metadata": {}}
 
-    return {"data": {"text/plain": plain_fallback}, "metadata": {}}
+    data = {"text/plain": plain_fallback}
+    if structured_table is not None:
+        data["application/x-strata-table+json"] = structured_table
+    return {"data": data, "metadata": {}}
 
 
 def execute(request):

@@ -1216,6 +1216,28 @@ mod tests {
     }
 
     #[test]
+    fn python_display_of_pandas_dataframe_includes_structured_table_payload() {
+        let notebook = Notebook::new("DisplayDf");
+        let mut session = SessionManager::new(&notebook);
+        session
+            .register_kernel(Box::new(PythonKernelAdapter::default()))
+            .unwrap();
+
+        let record = session
+            .run_code_cell(&Cell::code(
+                Language::Python,
+                "import pandas as pd\ndf = pd.DataFrame({'method': ['region_mean', 'random'], 'score': [0.75, 0.62]})\ndisplay(df)",
+            ))
+            .unwrap();
+
+        assert!(record.outputs.iter().any(|output| matches!(
+            output,
+            CellOutput::DisplayData { data, .. }
+                if data.contains_key("application/x-strata-table+json")
+        )));
+    }
+
+    #[test]
     fn hydration_replays_prior_successful_cells() {
         let notebook = Notebook::new("Hydrate").with_cells(vec![
             Cell::code(Language::Python, "value = 42"),
