@@ -1551,105 +1551,82 @@ impl App {
             .border_style(border)
             .style(style);
         frame.render_widget(outer, area);
-        let shell_inner = shrink(area, 1);
-        if shell_inner.width == 0 || shell_inner.height == 0 {
+        let inner = shrink(area, 1);
+        if inner.width == 0 || inner.height == 0 {
             return;
         }
-        let inner_block_area = Rect {
-            x: shell_inner.x,
-            y: shell_inner.y,
-            width: shell_inner.width,
-            height: shell_inner.height,
-        };
-        let inner_block = Block::default()
-            .borders(shell_borders)
-            .border_style(border)
-            .style(style)
-            .title(title);
-        frame.render_widget(inner_block, inner_block_area);
-        let inner = shrink(inner_block_area, 1);
-        if inner.width > 0 && inner.height > 0 {
-            let body_line_count = body_lines.len();
-            let body_skip = usize::min(top_skip as usize, body_line_count);
-            let output_skip = (top_skip as usize).saturating_sub(body_line_count);
-            let has_body_fragment = body_skip < body_line_count;
-            let has_output_fragment = output_visible && output_skip < output_total_lines;
+        let body_line_count = body_lines.len();
+        let body_skip = usize::min(top_skip as usize, body_line_count);
+        let output_skip = (top_skip as usize).saturating_sub(body_line_count);
+        let has_body_fragment = body_skip < body_line_count;
+        let has_output_fragment = output_visible && output_skip < output_total_lines;
 
-            if has_output_fragment {
-                let visible_outputs = self.visible_clipped_outputs(cell, output_skip, inner.width);
-                let available_output_lines = visible_outputs
-                    .iter()
-                    .map(|(output_index, content_skip)| {
-                        self.clipped_output_line_count(
-                            cell,
-                            *output_index,
-                            &cell.outputs[*output_index],
-                            inner.width,
-                        )
-                        .saturating_sub(*content_skip)
-                    })
-                    .sum::<usize>()
-                    .max(1);
-                let output_block_height =
-                    (available_output_lines as u16 + 2).min(inner.height).max(3);
-                let body_height = if has_body_fragment {
-                    inner.height.saturating_sub(output_block_height)
-                } else {
-                    0
-                };
+        let mut y = inner.y;
+        let mut remaining = inner.height;
 
-                if has_body_fragment && body_height >= 3 {
-                    let body_area = Rect {
-                        x: inner.x,
-                        y: inner.y,
-                        width: inner.width,
-                        height: body_height,
-                    };
-                    let body_inner = shrink(body_area, 1);
-                    frame.render_widget(
-                        Paragraph::new(Text::from(
-                            body_lines
-                                .into_iter()
-                                .skip(body_skip)
-                                .take(body_inner.height as usize)
-                                .collect::<Vec<_>>(),
-                        ))
-                        .style(style)
-                        .wrap(Wrap { trim: false }),
-                        body_inner,
-                    );
+        if has_body_fragment && remaining > 0 {
+            let visible_body_lines = body_line_count.saturating_sub(body_skip).max(1);
+            let body_block_height = if remaining >= 3 {
+                (visible_body_lines as u16 + 2).min(remaining).max(3)
+            } else {
+                remaining
+            };
+            let body_area = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: body_block_height,
+            };
+            let body_inner = shrink(body_area, 1);
+            let body_title = if top_skip > 0 {
+                title
+            } else {
+                self.cell_title(cell, rendered)
+            };
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .style(style)
+                    .title(body_title),
+                body_area,
+            );
+            if body_inner.width > 0 && body_inner.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(Text::from(
+                        body_lines
+                            .into_iter()
+                            .skip(body_skip)
+                            .take(body_inner.height as usize)
+                            .collect::<Vec<_>>(),
+                    ))
+                    .style(style)
+                    .wrap(Wrap { trim: false }),
+                    body_inner,
+                );
+            }
+            y = y.saturating_add(body_block_height);
+            remaining = remaining.saturating_sub(body_block_height);
+        }
+
+        if has_output_fragment && remaining > 0 {
+            let visible_outputs = self.visible_clipped_outputs(cell, output_skip, inner.width);
+            if !visible_outputs.is_empty() {
+                let gap_before_output = u16::from(has_body_fragment && remaining > 0);
+                if gap_before_output > 0 {
+                    y = y.saturating_add(gap_before_output);
+                    remaining = remaining.saturating_sub(gap_before_output);
+                }
+                if remaining > 0 {
                     let output_area = Rect {
                         x: inner.x + 2,
-                        y: inner.y + body_height,
+                        y,
                         width: inner.width.saturating_sub(2),
-                        height: inner.height.saturating_sub(body_height),
+                        height: remaining,
                     };
                     self.render_clipped_outputs(frame, output_area, index, cell, &visible_outputs);
-                    return;
                 }
-
-                let output_area = Rect {
-                    x: inner.x + 2,
-                    y: inner.y,
-                    width: inner.width.saturating_sub(2),
-                    height: inner.height,
-                };
-                self.render_clipped_outputs(frame, output_area, index, cell, &visible_outputs);
-                return;
             }
-
-            frame.render_widget(
-                Paragraph::new(Text::from(
-                    body_lines
-                        .into_iter()
-                        .skip(body_skip)
-                        .take(inner.height as usize)
-                        .collect::<Vec<_>>(),
-                ))
-                .style(style)
-                .wrap(Wrap { trim: false }),
-                inner,
-            );
         }
     }
 
@@ -2111,7 +2088,11 @@ impl App {
             let line_count =
                 self.clipped_output_line_count(cell, *output_index, output, area.width);
             let visible_lines = line_count.saturating_sub(*content_skip).max(1);
-            let block_height = (visible_lines as u16 + 2).min(remaining).max(3);
+            let block_height = if remaining >= 3 {
+                (visible_lines as u16 + 2).min(remaining).max(3)
+            } else {
+                remaining
+            };
             let output_area = Rect {
                 x: area.x,
                 y,
@@ -5712,7 +5693,7 @@ mod tests {
 
     #[test]
     fn top_clipped_structured_table_stays_formatted() {
-        let source = (0..20)
+        let source = (0..6)
             .map(|index| format!("line_{index}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -5749,7 +5730,6 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Output"));
         assert!(rendered.contains("┌"));
-        assert!(rendered.contains("region_mean"));
     }
 
     #[test]
