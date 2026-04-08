@@ -53,6 +53,8 @@ def _display_payload(obj):
     if obj is None:
         return {"data": {"text/plain": "None"}, "metadata": {}}
 
+    plain_fallback = repr(obj)
+
     bundle_method = getattr(obj, "_repr_mimebundle_", None)
     if callable(bundle_method):
         bundle = bundle_method(include=None, exclude=None)
@@ -68,6 +70,7 @@ def _display_payload(obj):
                 if coerced is not None:
                     normalized[str(mime)] = coerced
             if normalized:
+                normalized.setdefault("text/plain", plain_fallback)
                 return {"data": normalized, "metadata": metadata or {}}
 
     for mime, method_name in [
@@ -83,12 +86,14 @@ def _display_payload(obj):
             value = method()
             coerced = _coerce_mime_value(mime, value)
             if coerced:
-                return {"data": {mime: coerced}, "metadata": {}}
+                payload = {mime: coerced}
+                payload.setdefault("text/plain", plain_fallback)
+                return {"data": payload, "metadata": {}}
 
     if isinstance(obj, (str, int, float, bool, Path)):
         return {"data": {"text/plain": str(obj)}, "metadata": {}}
 
-    return {"data": {"text/plain": repr(obj)}, "metadata": {}}
+    return {"data": {"text/plain": plain_fallback}, "metadata": {}}
 
 
 def execute(request):

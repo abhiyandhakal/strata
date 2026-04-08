@@ -1194,6 +1194,30 @@ mod tests {
     }
 
     #[test]
+    fn python_display_of_dataframe_like_object_includes_plain_text_fallback() {
+        let notebook = Notebook::new("DisplayHtml");
+        let mut session = SessionManager::new(&notebook);
+        session
+            .register_kernel(Box::new(PythonKernelAdapter::default()))
+            .unwrap();
+
+        let record = session
+            .run_code_cell(&Cell::code(
+                Language::Python,
+                "class HtmlOnly:\n    def __repr__(self):\n        return 'table repr'\n    def _repr_html_(self):\n        return '<table><tr><td>x</td></tr></table>'\n\ndisplay(HtmlOnly())",
+            ))
+            .unwrap();
+
+        assert!(record.outputs.iter().any(|output| matches!(
+            output,
+            CellOutput::DisplayData { data, .. }
+                if data.get("text/plain")
+                    == Some(&serde_json::Value::String("table repr".to_string()))
+                    && data.contains_key("text/html")
+        )));
+    }
+
+    #[test]
     fn hydration_replays_prior_successful_cells() {
         let notebook = Notebook::new("Hydrate").with_cells(vec![
             Cell::code(Language::Python, "value = 42"),
