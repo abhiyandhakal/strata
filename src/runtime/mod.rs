@@ -995,14 +995,17 @@ fn reconcile_manifest_with_notebook(
             if matches!(cell.kind, CellKind::Code) {
                 broken_languages.insert(cell.language);
             }
-            clear_cell_runtime_state(cell);
             continue;
         }
 
         let record = record.expect("record checked above");
         valid_record_ids.insert(record.id.0.clone());
-        cell.execution_count = record.execution_count;
-        cell.outputs = record.outputs.clone();
+        if cell.execution_count.is_none() {
+            cell.execution_count = record.execution_count;
+        }
+        if cell.outputs.is_empty() {
+            cell.outputs = record.outputs.clone();
+        }
     }
 
     manifest.execution_history.retain(|record| {
@@ -1077,11 +1080,6 @@ fn reconcile_manifest_with_notebook(
 
 fn record_matches_cell(record: &ExecutionRecord, cell: &Cell) -> bool {
     record.cell_id == cell.id && record.language == cell.language && record.source == cell.source
-}
-
-fn clear_cell_runtime_state(cell: &mut Cell) {
-    cell.execution_count = None;
-    cell.outputs.clear();
 }
 
 #[cfg(test)]
@@ -1275,10 +1273,10 @@ mod tests {
                 .contains("invalidated stale checkpoint state")
         );
         assert!(manifest.execution_history.is_empty());
-        assert_eq!(edited.cells[0].execution_count, None);
-        assert!(edited.cells[0].outputs.is_empty());
-        assert_eq!(edited.cells[1].execution_count, None);
-        assert!(edited.cells[1].outputs.is_empty());
+        assert_eq!(edited.cells[0].execution_count, Some(99));
+        assert_eq!(edited.cells[0].outputs.len(), 1);
+        assert_eq!(edited.cells[1].execution_count, Some(99));
+        assert_eq!(edited.cells[1].outputs.len(), 1);
         let _ = first;
     }
 
