@@ -1232,6 +1232,9 @@ impl App {
                 cell_top = cell_bottom;
                 continue;
             }
+            if visible_bottom < cell_bottom && height < 4 {
+                break;
+            }
             let cell_area = Rect {
                 x: area.x,
                 y: area
@@ -4432,6 +4435,34 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("continued"));
+    }
+
+    #[test]
+    fn tiny_trailing_bottom_fragment_is_not_drawn_as_empty_box() {
+        let source = (0..14)
+            .map(|index| format!("line_{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notebook = Notebook::new("BottomClip").with_cells(vec![
+            Cell::markdown("top"),
+            Cell::code(Language::Python, source),
+        ]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.scroll_offset = 0;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("code python"));
     }
 
     #[test]
