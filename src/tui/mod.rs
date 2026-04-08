@@ -1437,12 +1437,23 @@ impl App {
         if body_collapsed {
             title = format!("{title} (collapsed)");
         }
-        let mut lines = Vec::new();
-        lines.push(Line::from(self.cell_prompt(index, cell)));
-        lines.extend(body_text.lines);
-        if !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed {
+        let mut body_lines = Vec::new();
+        body_lines.push(Line::from(self.cell_prompt(index, cell)));
+        body_lines.extend(body_text.lines);
+        let output_visible = !cell.outputs.is_empty() && !self.cell_mode(cell).output_collapsed;
+        let output_text = if output_visible {
+            Some(render_output_block(cell, &self.theme))
+        } else {
+            None
+        };
+        let output_total_lines = output_text
+            .as_ref()
+            .map(|text| text.lines.len().saturating_add(1))
+            .unwrap_or(0);
+        let mut lines = body_lines.clone();
+        if let Some(output_text) = &output_text {
             lines.push(Line::from("Output"));
-            lines.extend(render_output_block(cell, &self.theme).lines);
+            lines.extend(output_text.lines.clone());
         }
         let compact = area.width < 10 || area.height < if bottom_clipped { 3 } else { 5 };
         let visible_line_count = if compact {
@@ -1497,8 +1508,116 @@ impl App {
         frame.render_widget(inner_block, inner_block_area);
         let inner = shrink(inner_block_area, 1);
         if inner.width > 0 && inner.height > 0 {
+            let body_line_count = body_lines.len();
+            let body_skip = usize::min(top_skip as usize, body_line_count);
+            let output_skip = (top_skip as usize).saturating_sub(body_line_count);
+            let has_body_fragment = body_skip < body_line_count;
+            let has_output_fragment = output_visible && output_skip < output_total_lines;
+
+            if has_output_fragment {
+                let output_content_skip = output_skip.saturating_sub(1);
+                let output_text = output_text.unwrap();
+                let available_output_lines = output_text
+                    .lines
+                    .len()
+                    .saturating_sub(output_content_skip)
+                    .max(1);
+                let output_block_height =
+                    (available_output_lines as u16 + 2).min(inner.height).max(3);
+                let body_height = if has_body_fragment {
+                    inner.height.saturating_sub(output_block_height)
+                } else {
+                    0
+                };
+
+                if has_body_fragment && body_height >= 3 {
+                    let body_area = Rect {
+                        x: inner.x,
+                        y: inner.y,
+                        width: inner.width,
+                        height: body_height,
+                    };
+                    let body_inner = shrink(body_area, 1);
+                    frame.render_widget(
+                        Paragraph::new(Text::from(
+                            body_lines
+                                .into_iter()
+                                .skip(body_skip)
+                                .take(body_inner.height as usize)
+                                .collect::<Vec<_>>(),
+                        ))
+                        .style(style)
+                        .wrap(Wrap { trim: false }),
+                        body_inner,
+                    );
+                    let output_area = Rect {
+                        x: inner.x + 2,
+                        y: inner.y + body_height,
+                        width: inner.width.saturating_sub(2),
+                        height: inner.height.saturating_sub(body_height),
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Text::from(
+                            output_text
+                                .lines
+                                .into_iter()
+                                .skip(output_content_skip)
+                                .take(output_area.height.saturating_sub(2) as usize)
+                                .collect::<Vec<_>>(),
+                        ))
+                        .style(self.theme.style("output.block"))
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .style(self.theme.style("output.block"))
+                                .border_style(self.theme.style("output.border"))
+                                .title("Output"),
+                        ),
+                        output_area,
+                    );
+                    return;
+                }
+
+                let output_area = Rect {
+                    x: inner.x + 2,
+                    y: inner.y,
+                    width: inner.width.saturating_sub(2),
+                    height: inner.height,
+                };
+                frame.render_widget(
+                    Paragraph::new(Text::from(
+                        output_text
+                            .lines
+                            .into_iter()
+                            .skip(output_content_skip)
+                            .take(output_area.height.saturating_sub(2) as usize)
+                            .collect::<Vec<_>>(),
+                    ))
+                    .style(self.theme.style("output.block"))
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .style(self.theme.style("output.block"))
+                            .border_style(self.theme.style("output.border"))
+                            .title("Output"),
+                    ),
+                    output_area,
+                );
+                return;
+            }
+
             frame.render_widget(
-                Paragraph::new(text).style(style).wrap(Wrap { trim: false }),
+                Paragraph::new(Text::from(
+                    body_lines
+                        .into_iter()
+                        .skip(body_skip)
+                        .take(inner.height as usize)
+                        .collect::<Vec<_>>(),
+                ))
+                .style(style)
+                .wrap(Wrap { trim: false }),
                 inner,
             );
         }
@@ -4611,6 +4730,42 @@ mod tests {
         assert!(rendered.contains("collapsed"));
         assert!(!rendered.contains("line_0"));
         assert!(!rendered.contains("line_1"));
+    }
+
+    #[test]
+    fn top_clipped_cells_keep_output_in_separate_block() {
+        let mut cell = Cell::code(
+            Language::Python,
+            (0..20)
+                .map(|index| format!("line_{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        cell.outputs = vec![CellOutput::Stream {
+            name: "stdout".to_string(),
+            text: "hello\nworld".to_string(),
+        }];
+        let notebook = Notebook::new("ClipOutput").with_cells(vec![cell]);
+        let session = SessionManager::new(&notebook);
+        let mut app = App::new(notebook, None, session, false, Theme::default_theme(), None);
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.scroll_offset = 8;
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .filter_map(|row| row.find("Output"))
+                .any(|offset| offset > 0)
+        );
     }
 
     #[test]
