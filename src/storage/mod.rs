@@ -182,7 +182,7 @@ impl NotebookStorage {
                     language: Language::Python,
                     source: source.join(),
                     execution_count,
-                    outputs,
+                    outputs: outputs.into_iter().map(CellOutput::from).collect(),
                     metadata,
                 }),
             })
@@ -239,7 +239,12 @@ impl NotebookStorage {
                     metadata: cell.metadata.clone(),
                     execution_count: cell.execution_count,
                     source: split_lines(&cell.source).into(),
-                    outputs: cell.outputs.clone(),
+                    outputs: cell
+                        .outputs
+                        .clone()
+                        .into_iter()
+                        .map(IpynbOutput::from)
+                        .collect(),
                 },
             })
             .collect::<Vec<_>>();
@@ -873,8 +878,99 @@ enum IpynbCell {
         #[serde(default)]
         source: SourceField,
         #[serde(default)]
-        outputs: Vec<CellOutput>,
+        outputs: Vec<IpynbOutput>,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "output_type", rename_all = "snake_case")]
+enum IpynbOutput {
+    Stream {
+        name: String,
+        #[serde(default)]
+        text: SourceField,
+    },
+    ExecuteResult {
+        execution_count: u32,
+        data: BTreeMap<String, Value>,
+        #[serde(default)]
+        metadata: BTreeMap<String, Value>,
+    },
+    DisplayData {
+        data: BTreeMap<String, Value>,
+        #[serde(default)]
+        metadata: BTreeMap<String, Value>,
+    },
+    Error {
+        ename: String,
+        evalue: String,
+        #[serde(default)]
+        traceback: SourceField,
+    },
+}
+
+impl From<IpynbOutput> for CellOutput {
+    fn from(value: IpynbOutput) -> Self {
+        match value {
+            IpynbOutput::Stream { name, text } => CellOutput::Stream {
+                name,
+                text: text.join(),
+            },
+            IpynbOutput::ExecuteResult {
+                execution_count,
+                data,
+                metadata,
+            } => CellOutput::ExecuteResult {
+                execution_count,
+                data,
+                metadata,
+            },
+            IpynbOutput::DisplayData { data, metadata } => {
+                CellOutput::DisplayData { data, metadata }
+            }
+            IpynbOutput::Error {
+                ename,
+                evalue,
+                traceback,
+            } => CellOutput::Error {
+                ename,
+                evalue,
+                traceback: traceback.traceback_lines(),
+            },
+        }
+    }
+}
+
+impl From<CellOutput> for IpynbOutput {
+    fn from(value: CellOutput) -> Self {
+        match value {
+            CellOutput::Stream { name, text } => IpynbOutput::Stream {
+                name,
+                text: split_lines(&text).into(),
+            },
+            CellOutput::ExecuteResult {
+                execution_count,
+                data,
+                metadata,
+            } => IpynbOutput::ExecuteResult {
+                execution_count,
+                data,
+                metadata,
+            },
+            CellOutput::DisplayData { data, metadata } => {
+                IpynbOutput::DisplayData { data, metadata }
+            }
+            CellOutput::Error {
+                ename,
+                evalue,
+                traceback,
+            } => IpynbOutput::Error {
+                ename,
+                evalue,
+                traceback: traceback.into(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -892,6 +988,17 @@ impl SourceField {
             SourceField::String(value) => value,
             SourceField::Lines(values) => values.concat(),
             SourceField::Empty => String::new(),
+        }
+    }
+
+    fn traceback_lines(self) -> Vec<String> {
+        match self {
+            SourceField::String(value) => value.lines().map(ToString::to_string).collect(),
+            SourceField::Lines(values) => values
+                .into_iter()
+                .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
+                .collect(),
+            SourceField::Empty => Vec::new(),
         }
     }
 }
@@ -959,5 +1066,47 @@ mod tests {
         assert_eq!(parsed.cells[1].execution_count, Some(3));
         assert_eq!(parsed.cells[1].primary_output_text(), "hello\n");
         assert_eq!(parsed.cells[0].metadata.get("custom"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn ipynb_import_accepts_list_form_output_text() {
+        let raw = r##"
+        {
+          "nbformat": 4,
+          "nbformat_minor": 5,
+          "metadata": {},
+          "cells": [
+            {
+              "cell_type": "code",
+              "id": "cell-list-output",
+              "metadata": {},
+              "execution_count": 1,
+              "source": ["print('hello')\n"],
+              "outputs": [
+                {
+                  "output_type": "stream",
+                  "name": "stdout",
+                  "text": ["hello\n", "world\n"]
+                },
+                {
+                  "output_type": "error",
+                  "ename": "ValueError",
+                  "evalue": "bad",
+                  "traceback": ["Traceback...\n", "ValueError: bad\n"]
+                }
+              ]
+            }
+          ]
+        }
+        "##;
+
+        let parsed = NotebookStorage::parse_ipynb(raw).unwrap();
+
+        assert_eq!(parsed.cells[0].source, "print('hello')\n");
+        assert_eq!(parsed.cells[0].outputs[0].as_text(), "hello\nworld\n");
+        assert_eq!(
+            parsed.cells[0].outputs[1].as_text(),
+            "Traceback...\nValueError: bad"
+        );
     }
 }
